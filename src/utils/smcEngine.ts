@@ -235,3 +235,5 @@ export function detect5mCandlestickTrigger(k5: Candle[], zone: {low: number; hig
   if (late) score -= 18;
   return { side: valid ? side : 'NONE', pattern, score: clamp(score, 0, 40), valid, late, detail: valid ? `${pattern}${volumeBoost ? ' + Vol Boost' : ''}${late ? ' • LATE risk' : ''}` : 'NO TRIGGER — tunggu Sweep / Displacement + FVG di zona.' };
 }
+
+// Force update triggered at 2026-06-15 18:22
