@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#070b12" />
+    <link rel="icon" type="image/png" href="./favicon.png" />
+    <title>Sniper Entry Detector</title>
+    <script type="module" crossorigin src="./assets/index-CqizVmdm.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-COTENvpp.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  <script>
+      const now = new Date();
+      const h = now.getUTCHours();
+      const m = now.getUTCMinutes().toString().padStart(2, "0");
+      document.getElementById("time-val").innerText = h.toString().padStart(2, "0") + ":" + m;
+      document.getElementById("session-val").innerText = h >= 23 || h < 8 ? "ASIA" : h >= 7 && h < 16 ? "LONDON" : h >= 12 && h < 20 ? "NEW YORK" : "QUIET";
+    }, 1000);
+      const h = new Date().getUTCHours();
+      const s = h >= 23 || h < 8 ? "ASIA" : h >= 7 && h < 16 ? "LONDON" : h >= 12 && h < 20 ? "NEW YORK" : "QUIET";
+      document.getElementById("session-val").innerText = s;
+    }, 1000);
+  </script>
+  </body>
+</html>

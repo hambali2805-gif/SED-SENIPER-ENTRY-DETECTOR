@@ -1,0 +1,2359 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+// import brandLogoFull from './assets/sniper-entry-detector-full.jpg';
+// import brandLogoIcon from './assets/sniper-entry-detector-icon.png';
+import {
+  Activity,
+  AlertTriangle,
+  BarChart3,
+  BellRing,
+  Clipboard,
+  Database,
+  Flame,
+  Gauge,
+  LineChart,
+  Maximize2,
+  Minimize2,
+  RefreshCw,
+  Search,
+  ShieldAlert,
+  SlidersHorizontal,
+  Target,
+  TrendingDown,
+  TrendingUp,
+  Zap
+} from 'lucide-react';
+import BacktestPanel from './components/BacktestPanel';
+
+type Candle = {
+  t: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  v: number;
+  qv: number;
+  trades: number;
+  takerBuyBase: number;
+  takerBuyQuote: number;
+};
+
+type SymbolInfo = { symbol: string; baseAsset: string; quoteAsset: string; status: string };
+type Ticker = { symbol: string; lastPrice: string; priceChangePercent: string; quoteVolume: string; volume: string; highPrice: string; lowPrice: string };
+type MarkData = { markPrice?: string; indexPrice?: string; lastFundingRate?: string; nextFundingTime?: number };
+type OiHist = { sumOpenInterest: string; sumOpenInterestValue: string; timestamp: number };
+type LongShort = { symbol: string; longShortRatio: string; longAccount: string; shortAccount: string; timestamp: number };
+type TakerFlow = { buySellRatio: string; buyVol: string; sellVol: string; timestamp: number };
+type DepthLevel = { price: number; qty: number; notional: number };
+
+type TfAnalysis = {
+  tf: string;
+  trend: 'BULLISH' | 'BEARISH' | 'RANGE' | 'NO DATA';
+  score: number;
+  momentum: number;
+  volumeState: 'EXPANSION' | 'NORMAL' | 'LOW';
+};
+
+type Zone = { price: number; touches: number; distance: number; lastTime: number; top?: number; bottom?: number; score?: number; kind?: 'MAJOR' | 'ACTIVE' | 'EXECUTION'; broken?: boolean };
+type MiniWall = DepthLevel & { distance: number; strength: number };
+
+type FlowEngine = {
+  bias: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+  state: string;
+  bullishScore: number;
+  bearishScore: number;
+  flowScore: number;
+  netScore: number;
+  reasons: string[];
+};
+
+type Plan = {
+  status: 'LONG VALID' | 'LONG READY' | 'LONG RISKAN' | 'SHORT VALID' | 'SHORT READY' | 'SHORT RISKAN' | 'WAIT' | 'NO TRADE';
+  bias: string;
+  currentPrice: number;
+  markPrice: number;
+  entryZone?: [number, number];
+  keyLevels: string;
+  trigger: string;
+  invalidation: string;
+  tpAreas: number[];
+  confidence: number;
+  confluenceScore?: number;
+  structureScore?: number;
+  obScore?: number;
+  snrScore?: number;
+  flowScorePart?: number;
+  liquidityScore?: number;
+  flowNote: string;
+  warning: string;
+};
+
+type OrderBlock = {
+  type: 'BULLISH_OB' | 'BEARISH_OB';
+  top: number;
+  bottom: number;
+  startIndex: number;
+  sourceTime: number;
+  mitigated: boolean;
+  invalidated: boolean;
+  quality: 'STRONG' | 'MEDIUM' | 'WEAK';
+  strength: number;
+  distance: number;
+};
+
+type StructurePoint = { index: number; price: number; label: 'HH' | 'HL' | 'LH' | 'LL'; side: 'high' | 'low'; time: number };
+type StructureEvent = { index: number; price: number; label: 'BOS UP' | 'BOS DOWN' | 'CHoCH UP' | 'CHoCH DOWN'; time: number };
+type StructureSummary = { bias: 'BULLISH' | 'BEARISH' | 'RANGE'; points: StructurePoint[]; events: StructureEvent[]; summary: string; };
+
+type AlertItem = { level: 'hot' | 'warn' | 'info' | 'ok'; title: string; message: string; symbol?: string; status?: string; distance?: number; score?: number; zone?: string; zone1h?: string; refinement?: string; htf?: string; trigger?: string; triggerPattern?: string; obQuality?: string; side?: 'LONG' | 'SHORT'; action?: string; currentPrice?: number; entryAggressive?: number; entryMain?: number; entryConservative?: number; stopLoss?: number; tp1?: number; tp2?: number; tp3?: number; telegramImageReady?: boolean };
+type SniperMode = 'AGGRESSIVE' | 'NORMAL' | 'CONSERVATIVE';
+type AlertMode = 'AGGRESSIVE' | 'NORMAL' | 'STRICT';
+type PlanHistoryItem = { ts: number; symbol: string; status: string; mode: SniperMode; score: number; entry: string; bias: string; text: string };
+
+const API = 'https://fapi.binance.com';
+const FUTURES_DATA = 'https://fapi.binance.com/futures/data';
+const INTERVALS = ['5m', '15m', '1h', '4h'];
+const DEFAULT_WATCH = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'SUIUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT', 'ENAUSDT', 'LINKUSDT', 'AVAXUSDT', 'WIFUSDT', 'PEPEUSDT', 'NEARUSDT', 'ARBUSDT', 'OPUSDT', '1000SHIBUSDT', 'APTUSDT', 'AAVEUSDT'];
+const SNIPER_BIAS_TFS = '4H Bias + 1H OB';
+const SNIPER_ENTRY_TF = '1H OB + 15M Refinement';
+const SNIPER_TRIGGER_TF = '5M Candlestick';
+
+type ExecutionLevels = {
+  low: number;
+  high: number;
+  aggressive: number;
+  main: number;
+  conservative: number;
+  stopLoss: number;
+  tps: [number, number, number];
+};
+
+function normalizeZone(low: number, high: number) {
+  return { low: Math.min(low, high), high: Math.max(low, high) };
+}
+
+function buildExecutionLevels(side: 'LONG' | 'SHORT', zone: { low: number; high: number }, invalidationBase?: number, tpHints?: number[]) {
+  const { low, high } = normalizeZone(zone.low, zone.high);
+  const width = Math.max(Math.abs(high - low), Math.abs((high + low) / 2) * 0.0009 || 0.0001);
+  const aggressive = side === 'LONG' ? high : low;
+  const main = (low + high) / 2;
+  const conservative = side === 'LONG' ? low : high;
+  const rawStop = typeof invalidationBase === 'number' && Number.isFinite(invalidationBase)
+    ? invalidationBase
+    : side === 'LONG' ? low - width * 0.35 : high + width * 0.35;
+  const stopLoss = side === 'LONG'
+    ? Math.min(rawStop, low - width * 0.08)
+    : Math.max(rawStop, high + width * 0.08);
+  const risk = Math.max(Math.abs(main - stopLoss), width * 0.7, Math.abs(main) * 0.0012);
+  const hinted = (tpHints || []).filter((x): x is number => Number.isFinite(x));
+  const generated = side === 'LONG'
+    ? [main + risk * 1.2, main + risk * 2, main + risk * 3]
+    : [main - risk * 1.2, main - risk * 2, main - risk * 3];
+  const tps = [hinted[0] ?? generated[0], hinted[1] ?? generated[1], hinted[2] ?? generated[2]] as [number, number, number];
+  return { low, high, aggressive, main, conservative, stopLoss, tps } as ExecutionLevels;
+}
+
+function fmt(value: number | string | undefined | null, digits = 4) {
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (!Number.isFinite(n || NaN)) return '-';
+  const d = Math.abs(n as number) >= 100 ? 2 : digits;
+  return (n as number).toLocaleString('id-ID', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function fmtShort(value: number | string | undefined | null) {
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (!Number.isFinite(n || NaN)) return '-';
+  const abs = Math.abs(n as number);
+  if (abs >= 1_000_000_000) return `${((n as number) / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${((n as number) / 1_000_000).toFixed(2)}M`;
+  if (abs >= 1_000) return `${((n as number) / 1_000).toFixed(2)}K`;
+  return fmt(n, 2);
+}
+
+function fmtPct(value: number | string | undefined | null, digits = 2) {
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (!Number.isFinite(n || NaN)) return '-';
+  return `${(n as number) >= 0 ? '+' : ''}${(n as number).toFixed(digits)}%`;
+}
+
+function pctDistance(from: number, to: number) {
+  if (!from || !to) return 0;
+  return ((to - from) / from) * 100;
+}
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function safeNumber(v: any, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+async function apiGet<T>(path: string, params: Record<string, string | number | undefined> = {}): Promise<T> {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') qs.append(key, String(value));
+  });
+  const url = `${path}${qs.toString() ? `?${qs.toString()}` : ''}`;
+  const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${url}`);
+  return res.json();
+}
+
+function parseKlines(raw: any[]): Candle[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((k) => ({
+    t: Number(k[0]),
+    o: Number(k[1]),
+    h: Number(k[2]),
+    l: Number(k[3]),
+    c: Number(k[4]),
+    v: Number(k[5]),
+    qv: Number(k[7]),
+    trades: Number(k[8]),
+    takerBuyBase: Number(k[9]),
+    takerBuyQuote: Number(k[10])
+  })).filter(c => Number.isFinite(c.c));
+}
+
+function detectSwings(candles: Candle[], lookback = 3) {
+  const highs: { price: number; index: number; time: number }[] = [];
+  const lows: { price: number; index: number; time: number }[] = [];
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const c = candles[i];
+    let isHigh = true;
+    let isLow = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      if (candles[j].h >= c.h) isHigh = false;
+      if (candles[j].l <= c.l) isLow = false;
+    }
+    if (isHigh) highs.push({ price: c.h, index: i, time: c.t });
+    if (isLow) lows.push({ price: c.l, index: i, time: c.t });
+  }
+  return { highs: highs.slice(-22), lows: lows.slice(-22) };
+}
+
+function getSrnTolerance(tf: string, candles: Candle[]) {
+  const last = candles[candles.length - 1]?.c || 0;
+  const recent = candles.slice(-80);
+  const avgRangePct = recent.length && last
+    ? recent.reduce((s, c) => s + ((c.h - c.l) / Math.max(c.c, 1e-9)) * 100, 0) / recent.length
+    : 0.3;
+  const baseByTf: Record<string, number> = { '1m': 0.10, '5m': 0.16, '15m': 0.24, '1h': 0.38, '4h': 0.62, '1d': 1.10 };
+  return clamp(Math.max(baseByTf[tf] ?? 0.28, avgRangePct * 0.55), 0.08, 1.35);
+}
+
+function detectSrnZones(candles: Candle[], current: number, tolerancePct = 0.25, tf = '15m', kind: Zone['kind'] = 'ACTIVE') {
+  if (!candles.length || !current) return { support: [] as Zone[], resistance: [] as Zone[] };
+  const lookback = tf === '1m' || tf === '5m' ? 3 : tf === '15m' ? 4 : 5;
+  const swings = detectSwings(candles, lookback);
+  const adaptiveTolerance = Math.max(tolerancePct, getSrnTolerance(tf, candles));
+  const recentStart = Math.max(0, candles.length - 160);
+  const isBrokenSupport = (price: number, lastTime: number) =>
+    candles.filter(c => c.t > lastTime).slice(-50).some(c => c.c < price * (1 - adaptiveTolerance / 100 * 0.65));
+  const isBrokenResistance = (price: number, lastTime: number) =>
+    candles.filter(c => c.t > lastTime).slice(-50).some(c => c.c > price * (1 + adaptiveTolerance / 100 * 0.65));
+  const build = (points: { price: number; time: number; index?: number }[], side: 'support' | 'resistance') => {
+    const zones: Zone[] = [];
+    points.forEach((p: any) => {
+      const hit = zones.find(z => Math.abs(pctDistance(z.price, p.price)) <= adaptiveTolerance);
+      if (hit) {
+        hit.price = (hit.price * hit.touches + p.price) / (hit.touches + 1);
+        hit.touches += 1;
+        hit.lastTime = Math.max(hit.lastTime, p.time);
+      } else {
+        zones.push({ price: p.price, touches: 1, lastTime: p.time, distance: Math.abs(pctDistance(current, p.price)), kind });
+      }
+    });
+    return zones.map(z => {
+      const distance = Math.abs(pctDistance(current, z.price));
+      const recencyBonus = candles.findIndex(c => c.t === z.lastTime) >= recentStart ? 14 : 5;
+      const broken = side === 'support' ? isBrokenSupport(z.price, z.lastTime) : isBrokenResistance(z.price, z.lastTime);
+      const freshnessPenalty = broken ? 28 : 0;
+      const touchScore = Math.min(42, z.touches * 13);
+      const distanceScore = Math.max(0, 26 - distance * 7);
+      const score = Math.round(clamp(touchScore + distanceScore + recencyBonus - freshnessPenalty, 0, 100));
+      const band = z.price * (adaptiveTolerance / 100) * (kind === 'MAJOR' ? 1.25 : 0.9);
+      return {
+        ...z,
+        distance,
+        top: z.price + band,
+        bottom: z.price - band,
+        score,
+        broken
+      };
+    })
+      .filter(z => !z.broken || (z.score || 0) >= 38)
+      .sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))
+      .slice(0, 4);
+  };
+  return {
+    support: build(swings.lows.filter(x => x.price < current), 'support'),
+    resistance: build(swings.highs.filter(x => x.price > current), 'resistance')
+  };
+}
+
+function getMajorTf(tf: string) {
+  if (tf === '1m') return '5m';
+  if (tf === '5m') return '15m';
+  if (tf === '15m') return '1h';
+  if (tf === '1h') return '4h';
+  return '4h';
+}
+
+function analyzeTimeframe(candles: Candle[], tf: string): TfAnalysis {
+  if (!candles || candles.length < 35) return { tf, trend: 'NO DATA', score: 0, momentum: 0, volumeState: 'LOW' };
+  const last = candles[candles.length - 1];
+  const prev20 = candles.slice(-21, -1);
+  const avgClose = prev20.reduce((s, c) => s + c.c, 0) / prev20.length;
+  const avgVol = prev20.reduce((s, c) => s + c.v, 0) / prev20.length;
+  const base = candles[candles.length - 12]?.c || last.c;
+  const momentum = ((last.c - base) / base) * 100;
+  const trend = last.c > avgClose && momentum > 0 ? 'BULLISH' : last.c < avgClose && momentum < 0 ? 'BEARISH' : 'RANGE';
+  const score = trend === 'BULLISH' ? 1 : trend === 'BEARISH' ? -1 : 0;
+  const volumeState = last.v > avgVol * 1.35 ? 'EXPANSION' : last.v < avgVol * 0.75 ? 'LOW' : 'NORMAL';
+  return { tf, trend, score, momentum, volumeState };
+}
+
+function zoneOverlap(aLow: number, aHigh: number, bLow?: number, bHigh?: number) {
+  if (!Number.isFinite(aLow) || !Number.isFinite(aHigh) || bLow === undefined || bHigh === undefined) return false;
+  const lowA = Math.min(aLow, aHigh);
+  const highA = Math.max(aLow, aHigh);
+  const lowB = Math.min(bLow, bHigh);
+  const highB = Math.max(bLow, bHigh);
+  return Math.max(lowA, lowB) <= Math.min(highA, highB);
+}
+
+function isPriceNearZone(price: number, low: number, high: number, maxDistancePct = 1.15) {
+  const mid = (Math.min(low, high) + Math.max(low, high)) / 2;
+  return Math.abs(pctDistance(price, mid)) <= maxDistancePct;
+}
+
+function detectOrderBlocks(candles: Candle[], currentPrice: number) {
+  if (!candles.length) return { bullish: [] as OrderBlock[], bearish: [] as OrderBlock[] };
+  const bodies = candles.slice(-120).map(c => Math.abs(c.c - c.o));
+  const avgBody = (bodies.reduce((s, x) => s + x, 0) / Math.max(1, bodies.length)) || 1;
+  const avgVol = candles.slice(-120).reduce((s, c) => s + c.v, 0) / Math.max(1, candles.slice(-120).length);
+  const bullish: OrderBlock[] = [];
+  const bearish: OrderBlock[] = [];
+  for (let i = 8; i < candles.length - 5; i++) {
+    const c = candles[i];
+    const next = candles[i + 1];
+    const next2 = candles[i + 2];
+    const next3 = candles[i + 3];
+    const preHigh = Math.max(...candles.slice(Math.max(0, i - 8), i).map(x => x.h));
+    const preLow = Math.min(...candles.slice(Math.max(0, i - 8), i).map(x => x.l));
+    const impulseUpBody = Math.max(next.c, next2.c, next3.c) - c.c;
+    const impulseDownBody = c.c - Math.min(next.c, next2.c, next3.c);
+    const volExpansion = Math.max(next.v, next2.v, next3.v) > avgVol * 1.18;
+    const breakUp = [next, next2, next3].some(x => x.c > preHigh);
+    const breakDown = [next, next2, next3].some(x => x.c < preLow);
+    const upImpulse = c.c < c.o && impulseUpBody > avgBody * 1.45 && breakUp;
+    const downImpulse = c.c > c.o && impulseDownBody > avgBody * 1.45 && breakDown;
+    if (upImpulse) {
+      const top = c.h;
+      const bottom = c.l;
+      const future = candles.slice(i + 4);
+      const mitigated = future.some(x => x.l <= top && x.h >= bottom);
+      const invalidated = future.some(x => x.c < bottom);
+      const mid = (top + bottom) / 2;
+      const rawStrength = (impulseUpBody / avgBody) * 18 + (volExpansion ? 18 : 0) + (breakUp ? 16 : 0) - (mitigated ? 8 : 0) - (invalidated ? 42 : 0);
+      const strength = clamp(rawStrength, 0, 100);
+      const quality: OrderBlock['quality'] = strength >= 68 ? 'STRONG' : strength >= 48 ? 'MEDIUM' : 'WEAK';
+      bullish.push({ type: 'BULLISH_OB', top, bottom, startIndex: i, sourceTime: c.t, mitigated, invalidated, quality, strength, distance: Math.abs(pctDistance(currentPrice, mid)) });
+    }
+    if (downImpulse) {
+      const top = c.h;
+      const bottom = c.l;
+      const future = candles.slice(i + 4);
+      const mitigated = future.some(x => x.h >= bottom && x.l <= top);
+      const invalidated = future.some(x => x.c > top);
+      const mid = (top + bottom) / 2;
+      const rawStrength = (impulseDownBody / avgBody) * 18 + (volExpansion ? 18 : 0) + (breakDown ? 16 : 0) - (mitigated ? 8 : 0) - (invalidated ? 42 : 0);
+      const strength = clamp(rawStrength, 0, 100);
+      const quality: OrderBlock['quality'] = strength >= 68 ? 'STRONG' : strength >= 48 ? 'MEDIUM' : 'WEAK';
+      bearish.push({ type: 'BEARISH_OB', top, bottom, startIndex: i, sourceTime: c.t, mitigated, invalidated, quality, strength, distance: Math.abs(pctDistance(currentPrice, mid)) });
+    }
+  }
+  const sorter = (a: OrderBlock, b: OrderBlock) => {
+    const invalidPenalty = (a.invalidated ? 1 : 0) - (b.invalidated ? 1 : 0);
+    if (invalidPenalty !== 0) return invalidPenalty;
+    const qualityDiff = b.strength - a.strength;
+    if (Math.abs(qualityDiff) > 12) return qualityDiff;
+    return a.distance - b.distance;
+  };
+  return {
+    bullish: bullish.filter(x => !x.invalidated && x.quality !== 'WEAK').sort(sorter).slice(0, 4),
+    bearish: bearish.filter(x => !x.invalidated && x.quality !== 'WEAK').sort(sorter).slice(0, 4)
+  };
+}
+
+function analyzeStructure(candles: Candle[]): StructureSummary {
+  if (!candles.length) return { bias: 'RANGE', points: [], events: [], summary: 'Data belum cukup.' };
+  const lookback = candles.length > 180 ? 4 : 3;
+  const swings = detectSwings(candles, lookback);
+  const swingItems = [
+    ...swings.highs.map(x => ({ ...x, side: 'high' as const })),
+    ...swings.lows.map(x => ({ ...x, side: 'low' as const }))
+  ].sort((a, b) => a.index - b.index);
+  const points: StructurePoint[] = [];
+  const events: StructureEvent[] = [];
+  let prevHigh: { price: number; index: number; time: number } | undefined;
+  let prevLow: { price: number; index: number; time: number } | undefined;
+  let trend: 'BULLISH' | 'BEARISH' | 'RANGE' = 'RANGE';
+  for (const item of swingItems) {
+    if (item.side === 'high') {
+      if (!prevHigh) { prevHigh = item; continue; }
+      const label: 'HH' | 'LH' = item.price > prevHigh.price ? 'HH' : 'LH';
+      points.push({ index: item.index, price: item.price, label, side: 'high', time: item.time });
+      const closeBreak = candles.slice(prevHigh.index + 1, item.index + 4).some(c => c.c > prevHigh!.price);
+      if (label === 'HH' && closeBreak) {
+        events.push({ index: item.index, price: item.price, label: trend === 'BEARISH' ? 'CHoCH UP' : 'BOS UP', time: item.time });
+        trend = 'BULLISH';
+      }
+      prevHigh = item;
+    } else {
+      if (!prevLow) { prevLow = item; continue; }
+      const label: 'HL' | 'LL' = item.price > prevLow.price ? 'HL' : 'LL';
+      points.push({ index: item.index, price: item.price, label, side: 'low', time: item.time });
+      const closeBreak = candles.slice(prevLow.index + 1, item.index + 4).some(c => c.c < prevLow!.price);
+      if (label === 'LL' && closeBreak) {
+        events.push({ index: item.index, price: item.price, label: trend === 'BULLISH' ? 'CHoCH DOWN' : 'BOS DOWN', time: item.time });
+        trend = 'BEARISH';
+      }
+      prevLow = item;
+    }
+  }
+  const recent = points.slice(-6);
+  const hh = recent.filter(x => x.label === 'HH').length;
+  const hl = recent.filter(x => x.label === 'HL').length;
+  const lh = recent.filter(x => x.label === 'LH').length;
+  const ll = recent.filter(x => x.label === 'LL').length;
+  let bias: StructureSummary['bias'] = 'RANGE';
+  if (trend === 'BULLISH' && hh + hl >= lh + ll) bias = 'BULLISH';
+  else if (trend === 'BEARISH' && lh + ll >= hh + hl) bias = 'BEARISH';
+  else if (hh + hl >= 4) bias = 'BULLISH';
+  else if (lh + ll >= 4) bias = 'BEARISH';
+  const sortedPoints = points.sort((a, b) => a.index - b.index).slice(-12);
+  const sortedEvents = events.sort((a, b) => a.index - b.index).slice(-8);
+  const summary = bias === 'BULLISH'
+    ? 'Structure v2 bullish: close break mendukung HH/HL.'
+    : bias === 'BEARISH'
+    ? 'Structure v2 bearish: close break mendukung LH/LL.'
+    : 'Structure v2 mixed/range: tunggu BOS/CHoCH yang lebih bersih.';
+  return { bias, points: sortedPoints, events: sortedEvents, summary };
+}
+
+type TriggerResult = {
+  side: 'LONG' | 'SHORT' | 'NONE';
+  pattern: string;
+  score: number;
+  valid: boolean;
+  late: boolean;
+  detail: string;
+};
+
+function candleBody(c: Candle) {
+  return Math.abs(c.c - c.o);
+}
+
+function candleRange(c: Candle) {
+  return Math.max(0.00000001, c.h - c.l);
+}
+
+function upperWick(c: Candle) {
+  return c.h - Math.max(c.o, c.c);
+}
+
+function lowerWick(c: Candle) {
+  return Math.min(c.o, c.c) - c.l;
+}
+
+function isInsideZone(price: number, low: number, high: number) {
+  const lo = Math.min(low, high);
+  const hi = Math.max(low, high);
+  return price >= lo && price <= hi;
+}
+
+function distanceToZonePct(price: number, low: number, high: number) {
+  const lo = Math.min(low, high);
+  const hi = Math.max(low, high);
+  if (isInsideZone(price, lo, hi)) return 0;
+  const ref = price < lo ? lo : hi;
+  return Math.abs(pctDistance(price, ref));
+}
+
+function zoneMid(low: number, high: number) {
+  return (Math.min(low, high) + Math.max(low, high)) / 2;
+}
+
+function obStatusText(ob?: OrderBlock) {
+  if (!ob) return 'No OB';
+  if (ob.invalidated) return 'Invalid';
+  const fresh = !ob.mitigated ? 'Fresh' : 'Mitigated';
+  return `${ob.quality} • ${fresh} • Strength ${Math.round(ob.strength)}`;
+}
+
+function find15mRefinement(k15: Candle[], current: number, zone: {low: number; high: number}, side: 'LONG' | 'SHORT') {
+  const lo = Math.min(zone.low, zone.high);
+  const hi = Math.max(zone.low, zone.high);
+  const inZone = k15.filter(c => c.h >= lo && c.l <= hi).slice(-90);
+  const base = inZone.length ? inZone : k15.slice(-90);
+  const zones = detectSrnZones(base, current, 0.18, '15m', 'ACTIVE');
+  const obs = detectOrderBlocks(base, current);
+  if (side === 'LONG') {
+    const ob = obs.bullish[0];
+    const support = zones.support[0];
+    if (ob) return { low: ob.bottom, high: ob.top, label: `15M refined demand $${fmt(ob.bottom)} - $${fmt(ob.top)}`, score: ob.quality === 'STRONG' ? 10 : 7 };
+    if (support) return { low: support.bottom || support.price, high: support.top || support.price, label: `15M support refine $${fmt(support.bottom || support.price)} - $${fmt(support.top || support.price)}`, score: 6 };
+  } else {
+    const ob = obs.bearish[0];
+    const resistance = zones.resistance[0];
+    if (ob) return { low: ob.bottom, high: ob.top, label: `15M refined supply $${fmt(ob.bottom)} - $${fmt(ob.top)}`, score: ob.quality === 'STRONG' ? 10 : 7 };
+    if (resistance) return { low: resistance.bottom || resistance.price, high: resistance.top || resistance.price, label: `15M resistance refine $${fmt(resistance.bottom || resistance.price)} - $${fmt(resistance.top || resistance.price)}`, score: 6 };
+  }
+  return { low: lo, high: hi, label: `1H zone direct $${fmt(lo)} - $${fmt(hi)}`, score: 2 };
+}
+
+function detect5mCandlestickTrigger(k5: Candle[], zone: {low: number; high: number}, side: 'LONG' | 'SHORT'): TriggerResult {
+  if (k5.length < 28) return { side: 'NONE', pattern: 'NO DATA', score: 0, valid: false, late: false, detail: '5M data belum cukup.' };
+  const last = k5[k5.length - 1];
+  const prev = k5[k5.length - 2];
+  const prev2 = k5[k5.length - 3];
+  const recent = k5.slice(-24, -1);
+  const avgBody = recent.reduce((s, c) => s + candleBody(c), 0) / Math.max(1, recent.length);
+  const avgVol = recent.reduce((s, c) => s + c.v, 0) / Math.max(1, recent.length);
+  const body = candleBody(last);
+  const inZoneNow = last.h >= Math.min(zone.low, zone.high) && last.l <= Math.max(zone.low, zone.high);
+  const dist = distanceToZonePct(last.c, zone.low, zone.high);
+  const late = dist > 0.70 && !inZoneNow;
+  const volumeBoost = avgVol > 0 && last.v > avgVol * 1.2;
+  const strongBody = body > avgBody * 1.45;
+  const nowBull = last.c > last.o;
+  const nowBear = last.c < last.o;
+  const sweepLong = lowerWick(last) > body * 1.5 && last.l < prev.l && nowBull;
+  const sweepShort = upperWick(last) > body * 1.5 && last.h > prev.h && nowBear;
+  const displacementUp = nowBull && strongBody && last.c > prev.h;
+  const displacementDown = nowBear && strongBody && last.c < prev.l;
+  const fvgBullish = last.l > prev2.h && nowBull && strongBody;
+  const fvgBearish = last.h < prev2.l && nowBear && strongBody;
+  let pattern = 'NO TRIGGER';
+  let score = 0;
+  let valid = false;
+  if (side === 'LONG') {
+    if (sweepLong && fvgBullish) { pattern = 'Sniper: Sweep + FVG Bullish'; score = 35; valid = true; }
+    else if (displacementUp && fvgBullish) { pattern = 'Displacement + FVG Bullish'; score = 25; valid = true; }
+    else if (sweepLong) { pattern = 'Liquidity Sweep (Rejection)'; score = 18; valid = true; }
+    else if (displacementUp) { pattern = 'Bullish Displacement (No FVG)'; score = 15; valid = true; }
+  } else {
+    if (sweepShort && fvgBearish) { pattern = 'Sniper: Sweep + FVG Bearish'; score = 35; valid = true; }
+    else if (displacementDown && fvgBearish) { pattern = 'Displacement + FVG Bearish'; score = 25; valid = true; }
+    else if (sweepShort) { pattern = 'Liquidity Sweep (Rejection)'; score = 18; valid = true; }
+    else if (displacementDown) { pattern = 'Bearish Displacement (No FVG)'; score = 15; valid = true; }
+  }
+  if (valid && volumeBoost) score += 5;
+  if (valid && !inZoneNow && dist > 0.45) score -= 8;
+  if (late) score -= 18;
+  const detail = valid
+    ? `${pattern}${volumeBoost ? ' + Vol Boost' : ''}${late ? ' • LATE risk' : ''}`
+    : 'NO TRIGGER — tunggu Sweep / Displacement + FVG di zona.';
+  return { side: valid ? side : 'NONE', pattern, score: clamp(score, 0, 40), valid, late, detail };
+}
+
+function scoreSrnAgainstOb(support: Zone | undefined, resistance: Zone | undefined, bullOb: OrderBlock | undefined, bearOb: OrderBlock | undefined, side: 'LONG' | 'SHORT') {
+  if (side === 'LONG' && support) {
+    const overlap = bullOb ? zoneOverlap(bullOb.bottom, bullOb.top, support.bottom, support.top) : false;
+    return clamp((support.score || 0) * 0.16 + (overlap ? 8 : 0), 0, 20);
+  }
+  if (side === 'SHORT' && resistance) {
+    const overlap = bearOb ? zoneOverlap(bearOb.bottom, bearOb.top, resistance.bottom, resistance.top) : false;
+    return clamp((resistance.score || 0) * 0.16 + (overlap ? 8 : 0), 0, 20);
+  }
+  return 0;
+}
+
+function calcConfluence(args: {
+  side: 'LONG' | 'SHORT';
+  structure4h: StructureSummary;
+  structure1h: StructureSummary;
+  structure15: StructureSummary;
+  ob?: OrderBlock;
+  support?: Zone;
+  resistance?: Zone;
+  flow: FlowEngine;
+  miniPressure: string;
+}) {
+  const { side, structure4h, structure1h, structure15, ob, support, resistance, flow, miniPressure } = args;
+  const wanted = side === 'LONG' ? 'BULLISH' : 'BEARISH';
+  const opposite = side === 'LONG' ? 'BEARISH' : 'BULLISH';
+  let structureScore = 0;
+  if (structure4h.bias !== opposite) structureScore += 6;
+  if (structure1h.bias === wanted) structureScore += 9;
+  else if (structure1h.bias !== opposite) structureScore += 4;
+  if (structure15.bias === wanted) structureScore += 10;
+  else if (structure15.bias !== opposite) structureScore += 4;
+  const obScore = ob
+    ? clamp((ob.quality === 'STRONG' ? 18 : 12) + (ob.mitigated ? -4 : 5) + Math.max(0, 5 - ob.distance * 2), 0, 25)
+    : 0;
+  const snrScore = side === 'LONG'
+    ? scoreSrnAgainstOb(support, resistance, ob, undefined, side)
+    : scoreSrnAgainstOb(support, resistance, undefined, ob, side);
+  const flowAligned = (side === 'LONG' && flow.bias === 'BULLISH') || (side === 'SHORT' && flow.bias === 'BEARISH');
+  const flowScorePart = flowAligned ? clamp(flow.flowScore * 0.2, 0, 20) : flow.bias === 'NEUTRAL' ? 7 : 2;
+  const liquidityScore = side === 'LONG'
+    ? (miniPressure.includes('BUY') ? 10 : miniPressure.includes('SELL') ? 3 : 6)
+    : (miniPressure.includes('SELL') ? 10 : miniPressure.includes('BUY') ? 3 : 6);
+  const total = Math.round(clamp(structureScore + obScore + snrScore + flowScorePart + liquidityScore, 0, 100));
+  return {
+    total,
+    structureScore: Math.round(structureScore),
+    obScore: Math.round(obScore),
+    snrScore: Math.round(snrScore),
+    flowScorePart: Math.round(flowScorePart),
+    liquidityScore: Math.round(liquidityScore)
+  };
+}
+
+function buildFlowEngine(args: {
+  fundingRate: number;
+  oiChangePct: number;
+  priceChangePct: number;
+  longShortRatio: number;
+  topLongShortRatio: number;
+  takerRatio: number;
+  mtfScore: number;
+  wallImbalance: number;
+}): FlowEngine {
+  const { fundingRate, oiChangePct, priceChangePct, longShortRatio, topLongShortRatio, takerRatio, mtfScore, wallImbalance } = args;
+  let bull = 0;
+  let bear = 0;
+  const reasons: string[] = [];
+  if (takerRatio > 1.12) { bull += 18; reasons.push('taker buy agresif'); }
+  else if (takerRatio > 1.04) { bull += 9; reasons.push('taker buy sedikit dominan'); }
+  else if (takerRatio > 0 && takerRatio < 0.88) { bear += 18; reasons.push('taker sell agresif'); }
+  else if (takerRatio > 0 && takerRatio < 0.96) { bear += 9; reasons.push('taker sell sedikit dominan'); }
+  else reasons.push('taker flow netral');
+  if (oiChangePct > 1 && priceChangePct > 0) { bull += 16; reasons.push('OI naik + harga naik = long build-up'); }
+  else if (oiChangePct > 1 && priceChangePct < 0) { bear += 16; reasons.push('OI naik + harga turun = short build-up'); }
+  else if (oiChangePct < -1 && priceChangePct > 0) { bull += 9; reasons.push('OI turun + harga naik = short covering'); }
+  else if (oiChangePct < -1 && priceChangePct < 0) { bear += 9; reasons.push('OI turun + harga turun = long unwind'); }
+  else reasons.push('OI belum ekspansif');
+  if (fundingRate > 0.0002) { bear += 8; reasons.push('funding positif = long crowded'); }
+  else if (fundingRate < -0.0002) { bull += 8; reasons.push('funding negatif = short crowded'); }
+  else reasons.push('funding normal');
+  if (longShortRatio > 1.55) { bear += 7; reasons.push('account ratio terlalu long'); }
+  else if (longShortRatio > 0 && longShortRatio < 0.72) { bull += 7; reasons.push('account ratio terlalu short'); }
+  else reasons.push('global L/S seimbang');
+  if (topLongShortRatio > 1.22) { bull += 9; reasons.push('top trader condong long'); }
+  else if (topLongShortRatio > 0 && topLongShortRatio < 0.82) { bear += 9; reasons.push('top trader condong short'); }
+  if (mtfScore >= 2) { bull += 15; reasons.push('MTF bullish sinkron'); }
+  else if (mtfScore <= -2) { bear += 15; reasons.push('MTF bearish sinkron'); }
+  else reasons.push('MTF mixed/range');
+  if (wallImbalance > 18) { bull += 8; reasons.push('buy limit wall dominan'); }
+  else if (wallImbalance < -18) { bear += 8; reasons.push('sell limit wall dominan'); }
+  else reasons.push('order wall relatif seimbang');
+  const bullishScore = Math.round(clamp(bull, 0, 100));
+  const bearishScore = Math.round(clamp(bear, 0, 100));
+  const netScore = bullishScore - bearishScore;
+  const flowScore = Math.round(clamp(Math.max(bullishScore, bearishScore), 0, 100));
+  const bias = netScore >= 14 ? 'BULLISH' : netScore <= -14 ? 'BEARISH' : 'NEUTRAL';
+  let state = 'Neutral / no edge';
+  if (bias === 'BULLISH') state = flowScore >= 55 ? 'Bullish continuation / long pressure' : 'Bullish lean';
+  if (bias === 'BEARISH') state = flowScore >= 55 ? 'Bearish continuation / short pressure' : 'Bearish lean';
+  if (fundingRate > 0.0002 && longShortRatio > 1.45 && bias !== 'BULLISH') state = 'Long crowded / long trap risk';
+  if (fundingRate < -0.0002 && longShortRatio > 0 && longShortRatio < 0.75 && bias !== 'BEARISH') state = 'Short crowded / short squeeze risk';
+  return { bias, state, bullishScore, bearishScore, flowScore, netScore, reasons };
+}
+
+export default function App() {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [symbols, setSymbols] = useState<SymbolInfo[]>([]);
+  const [tickers, setTickers] = useState<Ticker[]>([]);
+  const [selectedSymbol, setSelectedSymbol] = useState(() => localStorage.getItem('binanceSelectedSymbol') || 'BTCUSDT');
+  const [query, setQuery] = useState('');
+  const [showFavoritesOnly, setShowFavoritesOnly] = useState(() => localStorage.getItem('binanceShowFavoritesOnly') === 'true');
+  const [favoriteCoins, setFavoriteCoins] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('binanceFavoriteCoins') || '[]'); }
+    catch { return []; }
+  });
+  const [planHistory, setPlanHistory] = useState<PlanHistoryItem[]>(() => {
+    try { return JSON.parse(localStorage.getItem('binancePlanHistory') || '[]'); }
+    catch { return []; }
+  });
+  const [favoriteRadarEnabled, setFavoriteRadarEnabled] = useState(() => localStorage.getItem('favoriteRadarEnabled') !== 'false');
+  const [alertMode, setAlertMode] = useState<AlertMode>(() => (localStorage.getItem('favoriteAlertMode') as AlertMode) || 'NORMAL');
+  const [favoriteAlerts, setFavoriteAlerts] = useState<AlertItem[]>([]);
+  const [favoriteRadarStatus, setFavoriteRadarStatus] = useState<'IDLE' | 'SCANNING' | 'READY' | 'OFF'>('IDLE');
+  const [favoriteLastScan, setFavoriteLastScan] = useState(0);
+  const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem('soundEnabled') === 'true');
+  const [telegramEnabled, setTelegramEnabled] = useState(() => localStorage.getItem('telegramEnabled') === 'true');
+  const [telegramImportantOnly, setTelegramImportantOnly] = useState(() => localStorage.getItem('telegramImportantOnly') !== 'false');
+  const [telegramBotToken, setTelegramBotToken] = useState(() => localStorage.getItem('telegramBotToken') || '');
+  const [telegramChatId, setTelegramChatId] = useState(() => localStorage.getItem('telegramChatId') || '');
+  const [telegramMode, setTelegramMode] = useState<'TEXT ONLY' | 'TEXT + CHART'>(() => (localStorage.getItem('telegramMode') as 'TEXT ONLY' | 'TEXT + CHART') || 'TEXT + CHART');
+  const [telegramStatus, setTelegramStatus] = useState<'OFF' | 'READY' | 'SENDING' | 'SENT' | 'ERROR'>('OFF');
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const lastSoundRef = useRef(0);
+  const sentTelegramRef = useRef<Record<string, number>>({});
+  const [interval, setIntervalState] = useState(() => localStorage.getItem('binanceInterval') || '15m');
+  const [candles, setCandles] = useState<Candle[]>([]);
+  const [mtf, setMtf] = useState<Record<string, Candle[]>>({ '5m': [], '15m': [], '1h': [], '4h': [] });
+  const [mark, setMark] = useState<MarkData>({});
+  const [depth, setDepth] = useState<{ bids: DepthLevel[]; asks: DepthLevel[] }>({ bids: [], asks: [] });
+  const [oiNow, setOiNow] = useState<number>(0);
+  const [oiHist, setOiHist] = useState<OiHist[]>([]);
+  const [fundingHistory, setFundingHistory] = useState<any[]>([]);
+  const [longShort, setLongShort] = useState<LongShort[]>([]);
+  const [topAccount, setTopAccount] = useState<LongShort[]>([]);
+  const [takerFlow, setTakerFlow] = useState<TakerFlow[]>([]);
+  const [apiStatus, setApiStatus] = useState<'CHECKING' | 'LIVE API' | 'API OFF'>('CHECKING');
+  const [apiError, setApiError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [liveSync, setLiveSync] = useState(() => localStorage.getItem('binanceLiveSync') === 'true');
+  const [lastUpdated, setLastUpdated] = useState<number>(0);
+  const [hover, setHover] = useState<Candle | null>(null);
+  const [zoom, setZoom] = useState(() => Number(localStorage.getItem('binanceZoom') || 100));
+  const [chartPan, setChartPan] = useState(0);
+  const [priceScale, setPriceScale] = useState(1);
+  const [priceOffset, setPriceOffset] = useState(0);
+  const [isChartFullscreen, setIsChartFullscreen] = useState(false);
+  const [sniperMode, setSniperMode] = useState<SniperMode>(() => (localStorage.getItem('binanceSniperMode') as SniperMode) || 'NORMAL');
+  const [streamResetKey, setStreamResetKey] = useState(0);
+  const [chartLayers, setChartLayers] = useState(() => {
+    try { return JSON.parse(localStorage.getItem('binanceChartLayers') || '') || { snr: true, ob: true, structure: true, walls: true }; }
+    catch { return { snr: true, ob: true, structure: true, walls: true }; }
+  });
+  const [wsStatus, setWsStatus] = useState<'CONNECTING' | 'REALTIME ON' | 'WS OFF'>('WS OFF');
+  const [streamPrice, setStreamPrice] = useState(0);
+  const wsRef = useRef<WebSocket | null>(null);
+  const lastWsRenderRef = useRef(0);
+  const touchRef = useRef<{ lastX: number; lastY: number; lastDistance: number; mode: 'pan' | 'pinch' | 'price' | 'vertical' | null }>({ lastX: 0, lastY: 0, lastDistance: 0, mode: null });
+  const mouseDragRef = useRef<{ active: boolean; lastX: number; lastY: number; mode: 'pan' | 'price' | 'vertical' | null }>({ active: false, lastX: 0, lastY: 0, mode: null });
+
+  useEffect(() => {
+    document.body.classList.toggle('chart-fullscreen-open', isChartFullscreen);
+    return () => document.body.classList.remove('chart-fullscreen-open');
+  }, [isChartFullscreen]);
+
+  const toggleFavorite = (symbol: string) => {
+    setFavoriteCoins(prev => prev.includes(symbol) ? prev.filter(x => x !== symbol) : [...prev, symbol].slice(0, 60));
+  };
+
+  const favoriteSet = useMemo(() => new Set(favoriteCoins), [favoriteCoins]);
+  const currentTicker = useMemo(() => tickers.find(t => t.symbol === selectedSymbol), [tickers, selectedSymbol]);
+  const lastCandlePrice = candles[candles.length - 1]?.c || 0;
+  const lastPrice = streamPrice || safeNumber(currentTicker?.lastPrice, lastCandlePrice);
+  const markPrice = safeNumber(mark.markPrice, lastPrice);
+  const fundingRate = safeNumber(mark.lastFundingRate, 0);
+  const priceChange24h = safeNumber(currentTicker?.priceChangePercent, 0);
+
+  const fetchKlines = async (symbol: string, tf: string, limit = 220) => {
+    const raw = await apiGet<any[]>(`${API}/fapi/v1/klines`, { symbol, interval: tf, limit });
+    return parseKlines(raw);
+  };
+
+  const loadStatic = async () => {
+    try {
+      setApiStatus('CHECKING');
+      const [exchange, tickerAll] = await Promise.all([
+        apiGet<any>(`${API}/fapi/v1/exchangeInfo`),
+        apiGet<Ticker[]>(`${API}/fapi/v1/ticker/24hr`)
+      ]);
+      const tradable = (exchange.symbols || [])
+        .filter((s: any) => s.contractType === 'PERPETUAL' && s.quoteAsset === 'USDT' && s.status === 'TRADING')
+        .map((s: any) => ({ symbol: s.symbol, baseAsset: s.baseAsset, quoteAsset: s.quoteAsset, status: s.status }))
+        .sort((a: SymbolInfo, b: SymbolInfo) => a.symbol.localeCompare(b.symbol));
+      setSymbols(tradable);
+      setTickers(tickerAll.filter(t => t.symbol.endsWith('USDT')));
+      setApiStatus('LIVE API');
+    } catch (err: any) {
+      setApiStatus('API OFF');
+      setApiError(`Gagal load Binance Futures: ${err?.message || err}`);
+    }
+  };
+
+  const loadSymbol = async (symbol = selectedSymbol) => {
+    setLoading(true);
+    setApiError('');
+    try {
+      const [activeCandles, mtf5, mtf15, mtf1h, mtf4h, markData, depthData, oi, oiHistory, funding, ls, topAcc, taker, tickerAll] = await Promise.all([
+        fetchKlines(symbol, interval, 240),
+        fetchKlines(symbol, '5m', 220),
+        fetchKlines(symbol, '15m', 220),
+        fetchKlines(symbol, '1h', 220),
+        fetchKlines(symbol, '4h', 220),
+        apiGet<MarkData>(`${API}/fapi/v1/premiumIndex`, { symbol }),
+        apiGet<any>(`${API}/fapi/v1/depth`, { symbol, limit: 100 }),
+        apiGet<any>(`${API}/fapi/v1/openInterest`, { symbol }),
+        apiGet<OiHist[]>(`${FUTURES_DATA}/openInterestHist`, { symbol, period: '5m', limit: 30 }),
+        apiGet<any[]>(`${API}/fapi/v1/fundingRate`, { symbol, limit: 8 }),
+        apiGet<LongShort[]>(`${FUTURES_DATA}/globalLongShortAccountRatio`, { symbol, period: '5m', limit: 30 }),
+        apiGet<LongShort[]>(`${FUTURES_DATA}/topLongShortAccountRatio`, { symbol, period: '5m', limit: 30 }),
+        apiGet<TakerFlow[]>(`${FUTURES_DATA}/takerlongshortRatio`, { symbol, period: '5m', limit: 30 }),
+        apiGet<Ticker[]>(`${API}/fapi/v1/ticker/24hr`)
+      ]);
+      setCandles(activeCandles);
+      setMtf({ '5m': mtf5, '15m': mtf15, '1h': mtf1h, '4h': mtf4h });
+      setMark(markData || {});
+      setDepth({
+        bids: (depthData?.bids || []).slice(0, 100).map((b: any[]) => ({ price: Number(b[0]), qty: Number(b[1]), notional: Number(b[0]) * Number(b[1]) })),
+        asks: (depthData?.asks || []).slice(0, 100).map((a: any[]) => ({ price: Number(a[0]), qty: Number(a[1]), notional: Number(a[0]) * Number(a[1]) }))
+      });
+      setOiNow(safeNumber(oi?.openInterest, 0));
+      setOiHist(Array.isArray(oiHistory) ? oiHistory : []);
+      setFundingHistory(Array.isArray(funding) ? funding : []);
+      setLongShort(Array.isArray(ls) ? ls : []);
+      setTopAccount(Array.isArray(topAcc) ? topAcc : []);
+      setTakerFlow(Array.isArray(taker) ? taker : []);
+      setTickers(tickerAll.filter(t => t.symbol.endsWith('USDT')));
+      setApiStatus('LIVE API');
+      setLastUpdated(Date.now());
+    } catch (err: any) {
+      setApiStatus('API OFF');
+      setCandles([]);
+      setMtf({ '5m': [], '15m': [], '1h': [], '4h': [] });
+      setApiError(`LIVE API Binance gagal. Tool dikunci tanpa demo. Detail: ${err?.message || err}`);
+      setLiveSync(false);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { loadStatic(); }, []);
+
+  useEffect(() => {
+    localStorage.setItem('binanceSelectedSymbol', selectedSymbol);
+    localStorage.setItem('binanceInterval', interval);
+    loadSymbol(selectedSymbol);
+  }, [selectedSymbol, interval]);
+
+  useEffect(() => {
+    localStorage.setItem('binanceZoom', String(zoom));
+    localStorage.setItem('binanceSniperMode', sniperMode);
+    localStorage.setItem('binanceChartLayers', JSON.stringify(chartLayers));
+    localStorage.setItem('binanceLiveSync', String(liveSync));
+    localStorage.setItem('binanceFavoriteCoins', JSON.stringify(favoriteCoins));
+    localStorage.setItem('binanceShowFavoritesOnly', String(showFavoritesOnly));
+    localStorage.setItem('binancePlanHistory', JSON.stringify(planHistory.slice(0, 5)));
+    localStorage.setItem('favoriteRadarEnabled', String(favoriteRadarEnabled));
+    localStorage.setItem('favoriteAlertMode', alertMode);
+    localStorage.setItem('soundEnabled', String(soundEnabled));
+    localStorage.setItem('telegramEnabled', String(telegramEnabled));
+    localStorage.setItem('telegramImportantOnly', String(telegramImportantOnly));
+    localStorage.setItem('telegramBotToken', telegramBotToken);
+    localStorage.setItem('telegramChatId', telegramChatId);
+    localStorage.setItem('telegramMode', telegramMode);
+  }, [zoom, sniperMode, chartLayers, liveSync, favoriteCoins, showFavoritesOnly, planHistory, favoriteRadarEnabled, alertMode, soundEnabled, telegramEnabled, telegramImportantOnly, telegramBotToken, telegramChatId, telegramMode]);
+
+  useEffect(() => {
+    if (!liveSync) return;
+    const id = window.setInterval(() => loadSymbol(selectedSymbol), 30000);
+    return () => window.clearInterval(id);
+  }, [liveSync, selectedSymbol, interval]);
+
+  useEffect(() => {
+    if (apiStatus !== 'LIVE API' || !selectedSymbol || !interval) return;
+    const symbol = selectedSymbol.toLowerCase();
+    const url = `wss://fstream.binance.com/ws/${symbol}@kline_${interval}`;
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setWsStatus('CONNECTING');
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+    ws.onopen = () => setWsStatus('REALTIME ON');
+    ws.onerror = () => setWsStatus('WS OFF');
+    ws.onclose = () => setWsStatus('WS OFF');
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        const k = msg?.k;
+        if (!k) return;
+        const nextCandle: Candle = {
+          t: Number(k.t),
+          o: Number(k.o),
+          h: Number(k.h),
+          l: Number(k.l),
+          c: Number(k.c),
+          v: Number(k.v),
+          qv: Number(k.q),
+          trades: Number(k.n),
+          takerBuyBase: Number(k.V),
+          takerBuyQuote: Number(k.Q)
+        };
+        const now = Date.now();
+        const closed = !!k.x;
+        setStreamPrice(nextCandle.c);
+        if (!closed && now - lastWsRenderRef.current < 650) return;
+        lastWsRenderRef.current = now;
+        setCandles(prev => {
+          if (!prev.length) return [nextCandle];
+          const last = prev[prev.length - 1];
+          if (last.t === nextCandle.t) return [...prev.slice(0, -1), nextCandle];
+          if (nextCandle.t > last.t) return [...prev.slice(-239), nextCandle];
+          return prev;
+        });
+      } catch {
+        // keep stream alive
+      }
+    };
+    return () => {
+      ws.close();
+    };
+  }, [apiStatus, selectedSymbol, interval, streamResetKey]);
+
+  const mtfAnalysis = useMemo(() => INTERVALS.map(tf => analyzeTimeframe(mtf[tf] || [], tf)), [mtf]);
+  const mtfScore = useMemo(() => mtfAnalysis.reduce((s, x) => s + x.score, 0), [mtfAnalysis]);
+  const activeZones = useMemo(() => detectSrnZones(candles, lastPrice || markPrice, 0.1, interval, 'ACTIVE'), [candles, lastPrice, markPrice, interval]);
+  const majorTf = useMemo(() => getMajorTf(interval), [interval]);
+  const majorSource = useMemo(() => (mtf[majorTf]?.length ? mtf[majorTf] : candles), [mtf, majorTf, candles]);
+  const majorZones = useMemo(() => detectSrnZones(majorSource, lastPrice || markPrice, 0.18, majorTf, 'MAJOR'), [majorSource, lastPrice, markPrice, majorTf]);
+  const zones = useMemo(() => ({
+    support: [...majorZones.support, ...activeZones.support].sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance)).slice(0, 4),
+    resistance: [...majorZones.resistance, ...activeZones.resistance].sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance)).slice(0, 4)
+  }), [majorZones, activeZones]);
+  const nearestSupport = useMemo(() => zones.support.sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))[0], [zones]);
+  const nearestResistance = useMemo(() => zones.resistance.sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))[0], [zones]);
+  const orderBlocks = useMemo(() => detectOrderBlocks(candles, lastPrice || markPrice), [candles, lastPrice, markPrice]);
+  const nearestBullOb = useMemo(() => orderBlocks.bullish[0], [orderBlocks]);
+  const nearestBearOb = useMemo(() => orderBlocks.bearish[0], [orderBlocks]);
+  const chartStructure = useMemo(() => analyzeStructure(candles), [candles]);
+
+  const entryCandles15 = useMemo(() => (mtf['15m']?.length ? mtf['15m'] : candles), [mtf, candles]);
+  const triggerCandles5 = useMemo(() => (mtf['5m']?.length ? mtf['5m'] : candles), [mtf, candles]);
+  const entryZones15 = useMemo(() => detectSrnZones(entryCandles15, lastPrice || markPrice, 0.14, '15m', 'ACTIVE'), [entryCandles15, lastPrice, markPrice]);
+  const entrySupport15 = useMemo(() => entryZones15.support.sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))[0], [entryZones15]);
+  const entryResistance15 = useMemo(() => entryZones15.resistance.sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))[0], [entryZones15]);
+  const entryOrderBlocks15 = useMemo(() => detectOrderBlocks(entryCandles15, lastPrice || markPrice), [entryCandles15, lastPrice, markPrice]);
+  const entryBullOb15 = useMemo(() => entryOrderBlocks15.bullish[0], [entryOrderBlocks15]);
+  const entryBearOb15 = useMemo(() => entryOrderBlocks15.bearish[0], [entryOrderBlocks15]);
+
+  const anchorCandles1h = useMemo(() => (mtf['1h']?.length ? mtf['1h'] : candles), [mtf, candles]);
+  const anchorZones1h = useMemo(() => detectSrnZones(anchorCandles1h, lastPrice || markPrice, 0.32, '1h', 'ACTIVE'), [anchorCandles1h, lastPrice, markPrice]);
+  const anchorSupport1h = useMemo(() => anchorZones1h.support.sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))[0], [anchorZones1h]);
+  const anchorResistance1h = useMemo(() => anchorZones1h.resistance.sort((a, b) => ((b.score || 0) - (a.score || 0)) || (a.distance - b.distance))[0], [anchorZones1h]);
+  const anchorOrderBlocks1h = useMemo(() => detectOrderBlocks(anchorCandles1h, lastPrice || markPrice), [anchorCandles1h, lastPrice, markPrice]);
+  const anchorBullOb1h = useMemo(() => anchorOrderBlocks1h.bullish[0], [anchorOrderBlocks1h]);
+  const anchorBearOb1h = useMemo(() => anchorOrderBlocks1h.bearish[0], [anchorOrderBlocks1h]);
+
+  const chartSetupZones = useMemo(() => {
+    const price = lastPrice || markPrice;
+    const longZone = anchorBullOb1h
+      ? { low: anchorBullOb1h.bottom, high: anchorBullOb1h.top, label: `1H BULL OB ${anchorBullOb1h.quality}`, side: 'LONG' as const, ob: anchorBullOb1h }
+      : anchorSupport1h
+      ? { low: anchorSupport1h.bottom || anchorSupport1h.price, high: anchorSupport1h.top || anchorSupport1h.price, label: '1H DEMAND/SUP', side: 'LONG' as const, ob: undefined }
+      : null;
+    const shortZone = anchorBearOb1h
+      ? { low: anchorBearOb1h.bottom, high: anchorBearOb1h.top, label: `1H BEAR OB ${anchorBearOb1h.quality}`, side: 'SHORT' as const, ob: anchorBearOb1h }
+      : anchorResistance1h
+      ? { low: anchorResistance1h.bottom || anchorResistance1h.price, high: anchorResistance1h.top || anchorResistance1h.price, label: '1H SUPPLY/RES', side: 'SHORT' as const, ob: undefined }
+      : null;
+    const build = (zone: typeof longZone) => {
+      if (!zone || !price) return null;
+      const refinement = find15mRefinement(entryCandles15, price, zone, zone.side);
+      const trigger = detect5mCandlestickTrigger(triggerCandles5, refinement, zone.side);
+      return {
+        ...zone,
+        refinement,
+        trigger,
+        distance: distanceToZonePct(price, refinement.low, refinement.high),
+        invalidation: zone.side === 'LONG' ? Math.min(zone.low, zone.high) : Math.max(zone.low, zone.high)
+      };
+    };
+    const longSetup = build(longZone);
+    const shortSetup = build(shortZone);
+    return { longSetup, shortSetup };
+  }, [lastPrice, markPrice, anchorBullOb1h, anchorBearOb1h, anchorSupport1h, anchorResistance1h, entryCandles15, triggerCandles5]);
+
+  const structure5 = useMemo(() => analyzeStructure(triggerCandles5 || []), [triggerCandles5]);
+  const structure15 = useMemo(() => analyzeStructure(entryCandles15 || []), [entryCandles15]);
+  const structure1h = useMemo(() => analyzeStructure(mtf['1h'] || []), [mtf]);
+  const structure4h = useMemo(() => analyzeStructure(mtf['4h'] || []), [mtf]);
+
+  const oiChangePct = useMemo(() => {
+    if (oiHist.length < 2) return 0;
+    const first = safeNumber(oiHist[0].sumOpenInterest);
+    const last = safeNumber(oiHist[oiHist.length - 1].sumOpenInterest);
+    return first ? ((last - first) / first) * 100 : 0;
+  }, [oiHist]);
+
+  const latestLs = longShort[longShort.length - 1];
+  const latestTop = topAccount[topAccount.length - 1];
+  const latestTaker = takerFlow[takerFlow.length - 1];
+  const takerRatio = safeNumber(latestTaker?.buySellRatio, 0);
+  const longShortRatio = safeNumber(latestLs?.longShortRatio, 0);
+  const topLongShortRatio = safeNumber(latestTop?.longShortRatio, 0);
+
+  const depthStats = useMemo(() => {
+    const bid = depth.bids.reduce((s, x) => s + x.notional, 0);
+    const ask = depth.asks.reduce((s, x) => s + x.notional, 0);
+    const total = bid + ask;
+    const imbalance = total ? ((bid - ask) / total) * 100 : 0;
+    const largestBid = [...depth.bids].sort((a, b) => b.notional - a.notional)[0];
+    const largestAsk = [...depth.asks].sort((a, b) => b.notional - a.notional)[0];
+    return { bid, ask, imbalance, largestBid, largestAsk };
+  }, [depth]);
+
+  const miniMap = useMemo(() => {
+    const current = lastPrice || markPrice;
+    const maxNotional = Math.max(...depth.bids.map(x => x.notional), ...depth.asks.map(x => x.notional), 1);
+    const bidWalls: MiniWall[] = [...depth.bids]
+      .filter(x => current ? x.price < current && Math.abs(pctDistance(current, x.price)) <= 5 : true)
+      .sort((a, b) => b.notional - a.notional)
+      .slice(0, 8)
+      .map(x => ({ ...x, distance: current ? pctDistance(current, x.price) : 0, strength: (x.notional / maxNotional) * 100 }));
+    const askWalls: MiniWall[] = [...depth.asks]
+      .filter(x => current ? x.price > current && Math.abs(pctDistance(current, x.price)) <= 5 : true)
+      .sort((a, b) => b.notional - a.notional)
+      .slice(0, 8)
+      .map(x => ({ ...x, distance: current ? pctDistance(current, x.price) : 0, strength: (x.notional / maxNotional) * 100 }));
+    const bidTotal = bidWalls.reduce((s, x) => s + x.notional, 0);
+    const askTotal = askWalls.reduce((s, x) => s + x.notional, 0);
+    const longPct = safeNumber(latestLs?.longAccount) * 100;
+    const shortPct = safeNumber(latestLs?.shortAccount) * 100;
+    const pressure = askTotal > bidTotal * 1.15 ? 'SELL LIMIT WALL DOMINAN' : bidTotal > askTotal * 1.15 ? 'BUY LIMIT WALL DOMINAN' : 'BALANCED WALLS';
+    const magnet = askTotal > bidTotal * 1.15 ? 'Upper wall lebih tebal, rawan rejection jika harga naik ke resistance.' : bidTotal > askTotal * 1.15 ? 'Lower wall lebih tebal, rawan bounce jika harga turun ke support.' : 'Wall seimbang, tunggu harga masuk level.';
+    return { bidWalls, askWalls, bidTotal, askTotal, longPct, shortPct, pressure, magnet };
+  }, [depth, lastPrice, markPrice, latestLs]);
+
+  const flow = useMemo(() => buildFlowEngine({
+    fundingRate,
+    oiChangePct,
+    priceChangePct: priceChange24h,
+    longShortRatio,
+    topLongShortRatio,
+    takerRatio,
+    mtfScore,
+    wallImbalance: depthStats.imbalance
+  }), [fundingRate, oiChangePct, priceChange24h, longShortRatio, topLongShortRatio, takerRatio, mtfScore, depthStats.imbalance]);
+
+  const plan: Plan | null = useMemo(() => {
+    if (apiStatus !== 'LIVE API' || !lastPrice || !candles.length) return null;
+    const bulls = mtfAnalysis.filter(x => x.trend === 'BULLISH').length;
+    const bears = mtfAnalysis.filter(x => x.trend === 'BEARISH').length;
+    const longAnchor = entryBullOb15
+      ? { low: entryBullOb15.bottom, high: entryBullOb15.top, label: `Bullish OB ${entryBullOb15.quality} $${fmt(entryBullOb15.bottom)} - $${fmt(entryBullOb15.top)}` }
+      : entrySupport15
+      ? { low: entrySupport15.bottom || entrySupport15.price, high: entrySupport15.top || entrySupport15.price, label: `Support zone $${fmt(entrySupport15.bottom || entrySupport15.price)} - $${fmt(entrySupport15.top || entrySupport15.price)}` }
+      : null;
+    const shortAnchor = entryBearOb15
+      ? { low: entryBearOb15.bottom, high: entryBearOb15.top, label: `Bearish OB ${entryBearOb15.quality} $${fmt(entryBearOb15.bottom)} - $${fmt(entryBearOb15.top)}` }
+      : entryResistance15
+      ? { low: entryResistance15.bottom || entryResistance15.price, high: entryResistance15.top || entryResistance15.price, label: `Resistance zone $${fmt(entryResistance15.bottom || entryResistance15.price)} - $${fmt(entryResistance15.top || entryResistance15.price)}` }
+      : null;
+    const longConfluence = calcConfluence({
+      side: 'LONG',
+      structure4h,
+      structure1h,
+      structure15,
+      ob: entryBullOb15,
+      support: entrySupport15,
+      resistance: entryResistance15,
+      flow,
+      miniPressure: miniMap.pressure
+    });
+    const shortConfluence = calcConfluence({
+      side: 'SHORT',
+      structure4h,
+      structure1h,
+      structure15,
+      ob: entryBearOb15,
+      support: entrySupport15,
+      resistance: entryResistance15,
+      flow,
+      miniPressure: miniMap.pressure
+    });
+    const chooseLong = longConfluence.total > shortConfluence.total + 5;
+    const chooseShort = shortConfluence.total > longConfluence.total + 5;
+    const warning = 'Accuracy Engine v2.4: SNR v3 + OB v2 + Structure v2 memakai deteksi otomatis berbasis candle Binance Perpetual. Tetap validasi manual sebelum entry.';
+    const flowNote = `${flow.state}: ${flow.reasons.slice(0, 5).join(' | ')} | Entry Model ${SNIPER_BIAS_TFS} bias + ${SNIPER_ENTRY_TF} POI + ${SNIPER_TRIGGER_TF} trigger | Structure 4H/1H/15M/5M ${structure4h.bias}/${structure1h.bias}/${structure15.bias}/${structure5.bias}`;
+    const thresholds = sniperMode === 'AGGRESSIVE'
+      ? { valid: 72, ready: 60, risk: 45 }
+      : sniperMode === 'CONSERVATIVE'
+      ? { valid: 88, ready: 74, risk: 60 }
+      : { valid: 80, ready: 66, risk: 50 };
+    const statusFromScore = (side: 'LONG' | 'SHORT', score: number, nearZone: boolean, hasOb: boolean): Plan['status'] => {
+      const validZoneOk = sniperMode === 'AGGRESSIVE' ? nearZone || hasOb : nearZone && hasOb;
+      const conservativeOk = sniperMode !== 'CONSERVATIVE' || hasOb;
+      if (score >= thresholds.valid && validZoneOk && conservativeOk) return side === 'LONG' ? 'LONG VALID' : 'SHORT VALID';
+      if (score >= thresholds.ready) return side === 'LONG' ? 'LONG READY' : 'SHORT READY';
+      if (score >= thresholds.risk) return side === 'LONG' ? 'LONG RISKAN' : 'SHORT RISKAN';
+      return 'WAIT';
+    };
+    if (chooseLong && longAnchor) {
+      const score = longConfluence.total;
+      const nearZone = isPriceNearZone(lastPrice, longAnchor.low, longAnchor.high, 1.2);
+      const tp1 = entryResistance15?.price || lastPrice * 1.012;
+      const status = statusFromScore('LONG', score, nearZone, !!entryBullOb15);
+      return {
+        status,
+        bias: `LONG BIAS | Structure ${structure4h.bias}/${structure1h.bias}/${structure15.bias} | ${bulls}/4 TF bullish`,
+        currentPrice: lastPrice,
+        markPrice,
+        entryZone: [Math.min(longAnchor.low, longAnchor.high), Math.max(longAnchor.low, longAnchor.high)],
+        keyLevels: `${longAnchor.label} | Major/Active Support score ${entrySupport15?.score || 0} | Resistance $${fmt(entryResistance15?.price || lastPrice * 1.012)}`,
+        trigger: entryBullOb15 ? 'Limit buy pada 15M bullish OB/support zone. Trigger dan invalidasi pakai 5M.' : 'Limit buy riskan karena 15M belum punya bullish OB kuat; tunggu 5M CHoCH/BOS up atau gunakan size kecil.',
+        invalidation: `Close 5m kuat di bawah $${fmt((entryBullOb15 ? entryBullOb15.bottom : entrySupport15?.bottom || entrySupport15?.price || lastPrice) * 0.994)}`,
+        tpAreas: [tp1, tp1 * 1.006, tp1 * 1.012],
+        confidence: score,
+        confluenceScore: score,
+        structureScore: longConfluence.structureScore,
+        obScore: longConfluence.obScore,
+        snrScore: longConfluence.snrScore,
+        flowScorePart: longConfluence.flowScorePart,
+        liquidityScore: longConfluence.liquidityScore,
+        flowNote,
+        warning
+      };
+    }
+    if (chooseShort && shortAnchor) {
+      const score = shortConfluence.total;
+      const nearZone = isPriceNearZone(lastPrice, shortAnchor.low, shortAnchor.high, 1.2);
+      const tp1 = entrySupport15?.price || lastPrice * 0.988;
+      const status = statusFromScore('SHORT', score, nearZone, !!entryBearOb15);
+      return {
+        status,
+        bias: `SHORT BIAS | Structure ${structure4h.bias}/${structure1h.bias}/${structure15.bias} | ${bears}/4 TF bearish`,
+        currentPrice: lastPrice,
+        markPrice,
+        entryZone: [Math.min(shortAnchor.low, shortAnchor.high), Math.max(shortAnchor.low, shortAnchor.high)],
+        keyLevels: `${shortAnchor.label} | Major/Active Resistance score ${entryResistance15?.score || 0} | Support $${fmt(entrySupport15?.price || lastPrice * 0.988)}`,
+        trigger: entryBearOb15 ? 'Limit short pada 15M bearish OB/resistance zone. Trigger dan invalidasi pakai 5M.' : 'Limit short riskan karena 15M belum punya bearish OB kuat; tunggu 5M CHoCH/BOS down atau gunakan size kecil.',
+        invalidation: `Close 5m kuat di atas $${fmt((entryBearOb15 ? entryBearOb15.top : entryResistance15?.top || entryResistance15?.price || lastPrice) * 1.006)}`,
+        tpAreas: [tp1, tp1 * 0.994, tp1 * 0.988],
+        confidence: score,
+        confluenceScore: score,
+        structureScore: shortConfluence.structureScore,
+        obScore: shortConfluence.obScore,
+        snrScore: shortConfluence.snrScore,
+        flowScorePart: shortConfluence.flowScorePart,
+        liquidityScore: shortConfluence.liquidityScore,
+        flowNote,
+        warning
+      };
+    }
+    const best = Math.max(longConfluence.total, shortConfluence.total);
+    return {
+      status: best < 45 ? 'NO TRADE' : 'WAIT',
+      bias: `MIXED | Long ${longConfluence.total} vs Short ${shortConfluence.total} | Structure ${structure4h.bias}/${structure1h.bias}/${structure15.bias}`,
+      currentPrice: lastPrice,
+      markPrice,
+      keyLevels: `Bullish OB ${entryBullOb15 ? `$${fmt(entryBullOb15.bottom)} - $${fmt(entryBullOb15.top)} ${entryBullOb15.quality}` : '-'} | Bearish OB ${entryBearOb15 ? `$${fmt(entryBearOb15.bottom)} - $${fmt(entryBearOb15.top)} ${entryBearOb15.quality}` : '-'} | Support zone ${entrySupport15 ? `$${fmt(entrySupport15.bottom || entrySupport15.price)} - $${fmt(entrySupport15.top || entrySupport15.price)}` : '-'} | Resistance zone ${entryResistance15 ? `$${fmt(entryResistance15.bottom || entryResistance15.price)} - $${fmt(entryResistance15.top || entryResistance15.price)}` : '-'}`,
+      trigger: 'Confluence belum cukup bersih. Tunggu harga masuk 15M OB/SNR utama dan 5M trigger searah.',
+      invalidation: 'Tunggu BOS/CHoCH close-confirmed atau break/reclaim level kunci.',
+      tpAreas: [entrySupport15?.price || lastPrice * 0.99, entryResistance15?.price || lastPrice * 1.01],
+      confidence: best,
+      confluenceScore: best,
+      structureScore: Math.max(longConfluence.structureScore, shortConfluence.structureScore),
+      obScore: Math.max(longConfluence.obScore, shortConfluence.obScore),
+      snrScore: Math.max(longConfluence.snrScore, shortConfluence.snrScore),
+      flowScorePart: Math.max(longConfluence.flowScorePart, shortConfluence.flowScorePart),
+      liquidityScore: Math.max(longConfluence.liquidityScore, shortConfluence.liquidityScore),
+      flowNote,
+      warning
+    };
+  }, [apiStatus, lastPrice, markPrice, candles.length, mtfAnalysis, flow, entrySupport15, entryResistance15, mtfScore, entryBullOb15, entryBearOb15, structure5, structure15, structure1h, structure4h, miniMap.pressure, sniperMode]);
+
+  const selectedExecution = useMemo(() => {
+    if (!plan?.entryZone) return null;
+    const side: 'LONG' | 'SHORT' = (plan.status.includes('SHORT') || plan.bias.includes('SHORT')) ? 'SHORT' : 'LONG';
+    const invalidBase = side === 'LONG'
+      ? (chartSetupZones.longSetup?.invalidation ?? plan.entryZone[0])
+      : (chartSetupZones.shortSetup?.invalidation ?? plan.entryZone[1]);
+    return buildExecutionLevels(side, { low: plan.entryZone[0], high: plan.entryZone[1] }, invalidBase, plan.tpAreas);
+  }, [plan, chartSetupZones]);
+
+  const copyText = useMemo(() => {
+    if (!plan) return 'LIVE API belum aktif atau data belum cukup.';
+    const entry = plan.entryZone ? `$${fmt(plan.entryZone[0])} - $${fmt(plan.entryZone[1])}` : '-';
+    const tp = plan.tpAreas.map((x, i) => `TP${i + 1}: $${fmt(x)}`).join(' | ');
+    return [
+      `PAIR: ${selectedSymbol}`,
+      `SNIPER MODE: ${sniperMode}`,
+      `ENTRY MODEL: Bias ${SNIPER_BIAS_TFS} | Entry Zone ${SNIPER_ENTRY_TF} | Trigger ${SNIPER_TRIGGER_TF}`,
+      `STATUS: ${plan.status}`,
+      `BIAS: ${plan.bias}`,
+      `PRICE: $${fmt(plan.currentPrice)}`,
+      `MARK PRICE: $${fmt(plan.markPrice)}`,
+      `FLOW SCORE: ${flow.flowScore}/100 | Bull ${flow.bullishScore} vs Bear ${flow.bearishScore} | ${flow.bias}`,
+      `FUNDING: ${(fundingRate * 100).toFixed(4)}%`,
+      `OI CHANGE: ${fmtPct(oiChangePct)}`,
+      `L/S RATIO: ${longShortRatio ? longShortRatio.toFixed(2) : '-'}`,
+      `TOP TRADER L/S: ${topLongShortRatio ? topLongShortRatio.toFixed(2) : '-'}`,
+      `TAKER FLOW: ${takerRatio ? takerRatio.toFixed(2) : '-'}`,
+      `MINI MAP: ${miniMap.pressure} | Buy Limit $${fmtShort(miniMap.bidTotal)} / Sell Limit $${fmtShort(miniMap.askTotal)}`,
+      `LEVEL KUNCI: ${plan.keyLevels}`,
+      `ENTRY ZONE: ${entry}`,
+      `ENTRY AGGRESSIVE: ${selectedExecution ? `$${fmt(selectedExecution.aggressive)}` : '-'}`,
+      `ENTRY MAIN: ${selectedExecution ? `$${fmt(selectedExecution.main)}` : '-'}`,
+      `ENTRY CONSERVATIVE: ${selectedExecution ? `$${fmt(selectedExecution.conservative)}` : '-'}`,
+      `TRIGGER ENTRY: ${plan.trigger}`,
+      `STOP LOSS: ${selectedExecution ? `$${fmt(selectedExecution.stopLoss)}` : plan.invalidation}`,
+      `INVALIDASI: ${plan.invalidation}`,
+      `TP AREA: ${selectedExecution ? `TP1: $${fmt(selectedExecution.tps[0])} | TP2: $${fmt(selectedExecution.tps[1])} | TP3: $${fmt(selectedExecution.tps[2])}` : tp}`,
+      `CONFLUENCE SCORE: ${plan.confluenceScore || plan.confidence}/100`,
+      `SCORE DETAIL: Structure ${plan.structureScore || 0} | OB ${plan.obScore || 0} | SNR ${plan.snrScore || 0} | Flow ${plan.flowScorePart || 0} | Liquidity ${plan.liquidityScore || 0}`,
+      `CONFIDENCE: ${plan.confidence}%`,
+      `STRUCTURE: 4H ${structure4h.bias} | 1H ${structure1h.bias} | 15M ${structure15.bias} | 5M ${structure5.bias}`,
+      `15M ORDER BLOCK: Bullish ${entryBullOb15 ? `$${fmt(entryBullOb15.bottom)} - $${fmt(entryBullOb15.top)} ${entryBullOb15.quality}` : '-'} | Bearish ${entryBearOb15 ? `$${fmt(entryBearOb15.bottom)} - $${fmt(entryBearOb15.top)} ${entryBearOb15.quality}` : '-'}`,
+      `FLOW NOTE: ${plan.flowNote || '-'}`,
+      `WARNING: ${plan.warning || '-'}`
+    ].join('\n');
+  }, [plan, selectedSymbol, sniperMode, flow, fundingRate, oiChangePct, longShortRatio, topLongShortRatio, takerRatio, miniMap, structure4h, structure1h, structure15, structure5, entryBullOb15, entryBearOb15, selectedExecution]);
+
+  useEffect(() => {
+    if (!plan || apiStatus !== 'LIVE API') return;
+    const entry = plan.entryZone ? `$${fmt(plan.entryZone[0])} - $${fmt(plan.entryZone[1])}` : '-';
+    const key = `${selectedSymbol}-${plan.status}-${entry}-${plan.confluenceScore || plan.confidence}`;
+    setPlanHistory(prev => {
+      const prevKey = prev[0] ? `${prev[0].symbol}-${prev[0].status}-${prev[0].entry}-${prev[0].score}` : '';
+      if (prevKey === key) return prev;
+      const next: PlanHistoryItem = {
+        ts: Date.now(),
+        symbol: selectedSymbol,
+        status: plan.status,
+        mode: sniperMode,
+        score: plan.confluenceScore || plan.confidence,
+        entry,
+        bias: plan.bias,
+        text: copyText
+      };
+      return [next, ...prev].slice(0, 5);
+    });
+  }, [plan?.status, plan?.entryZone?.[0], plan?.entryZone?.[1], plan?.confluenceScore, selectedSymbol, sniperMode, apiStatus]);
+
+  const filteredSymbols = useMemo(() => {
+    const q = query.trim().toUpperCase();
+    const base = symbols.length ? symbols : DEFAULT_WATCH.map(s => ({ symbol: s, baseAsset: s.replace('USDT', ''), quoteAsset: 'USDT', status: 'TRADING' }));
+    const favoriteBase = favoriteCoins.length ? base.filter(s => favoriteSet.has(s.symbol)) : [];
+    let source = showFavoritesOnly && favoriteCoins.length ? favoriteBase : base;
+    if (!q) {
+      const topSet = new Set([...favoriteCoins, ...DEFAULT_WATCH]);
+      return [...source.filter(s => topSet.has(s.symbol)), ...source.filter(s => !topSet.has(s.symbol)).slice(0, 100)].slice(0, 120);
+    }
+    return source.filter(s => s.symbol.includes(q) || s.baseAsset.includes(q)).slice(0, 120);
+  }, [symbols, query, showFavoritesOnly, favoriteCoins, favoriteSet]);
+
+  const scannerRows = useMemo(() => {
+    const rows = [...tickers]
+      .filter(t => t.symbol.endsWith('USDT') && safeNumber(t.quoteVolume) > 0)
+      .map(t => {
+        const change = safeNumber(t.priceChangePercent);
+        const qv = safeNumber(t.quoteVolume);
+        const volatility = Math.abs(change);
+        const volumeScore = clamp(Math.log10(qv + 1) * 5, 0, 60);
+        const volScore = clamp(volatility * 3, 0, 40);
+        const heatScore = Math.round(clamp(volumeScore + volScore, 0, 100));
+        const setup = change > 4 ? 'LONG MOMENTUM' : change < -4 ? 'SHORT MOMENTUM' : volatility > 2.5 ? 'ACTIVE RANGE' : 'WATCH';
+        const reason = change > 4 ? 'strong 24h impulse' : change < -4 ? 'heavy 24h pressure' : volatility > 2.5 ? 'volatility active' : 'low volatility';
+        return { ...t, change, qv, heatScore, setup, reason };
+      })
+      .sort((a, b) => b.heatScore - a.heatScore)
+      .slice(0, 30);
+    return rows;
+  }, [tickers]);
+
+  const topFunding = useMemo(() => {
+    const latest = fundingHistory[fundingHistory.length - 1];
+    return latest ? safeNumber(latest.fundingRate, fundingRate) : fundingRate;
+  }, [fundingHistory, fundingRate]);
+
+  useEffect(() => {
+    if (!telegramEnabled) setTelegramStatus('OFF');
+    else if (telegramBotToken.trim() && telegramChatId.trim() && telegramStatus === 'OFF') setTelegramStatus('READY');
+    else if ((!telegramBotToken.trim() || !telegramChatId.trim()) && telegramEnabled) setTelegramStatus('ERROR');
+  }, [telegramEnabled, telegramBotToken, telegramChatId]);
+
+  const alertRules = useMemo(() => {
+    if (alertMode === 'AGGRESSIVE') return { near: 0.65, maxWatch: 1.10, minWatchScore: 62, minNearScore: 70, minHitScore: 78, scanLimit: 18 };
+    if (alertMode === 'STRICT') return { near: 0.32, maxWatch: 0.58, minWatchScore: 74, minNearScore: 80, minHitScore: 88, scanLimit: 12 };
+    return { near: 0.45, maxWatch: 0.82, minWatchScore: 68, minNearScore: 76, minHitScore: 84, scanLimit: 16 };
+  }, [alertMode]);
+
+  const analyzeFavoriteSymbol = async (symbol: string): Promise<AlertItem | null> => {
+    try {
+      const [k5, k15, k1h, k4h] = await Promise.all([
+        fetchKlines(symbol, '5m', 190),
+        fetchKlines(symbol, '15m', 240),
+        fetchKlines(symbol, '1h', 220),
+        fetchKlines(symbol, '4h', 160)
+      ]);
+      const current = k5[k5.length - 1]?.c || k15[k15.length - 1]?.c || k1h[k1h.length - 1]?.c || 0;
+      if (!current) return null;
+      const a4h = analyzeTimeframe(k4h, '4h');
+      const a1h = analyzeTimeframe(k1h, '1h');
+      const a15 = analyzeTimeframe(k15, '15m');
+      const a5 = analyzeTimeframe(k5, '5m');
+      const structure4h = analyzeStructure(k4h);
+      const structure1h = analyzeStructure(k1h);
+      const structure15 = analyzeStructure(k15);
+      const obs1h = detectOrderBlocks(k1h, current);
+      const zones1h = detectSrnZones(k1h, current, 0.32, '1h', 'ACTIVE');
+      const bullOb1h = obs1h.bullish[0];
+      const bearOb1h = obs1h.bearish[0];
+      const demand1h = zones1h.support[0];
+      const supply1h = zones1h.resistance[0];
+      const buildPrimaryZone = (side: 'LONG' | 'SHORT') => {
+        if (side === 'LONG') {
+          if (bullOb1h) return { low: bullOb1h.bottom, high: bullOb1h.top, label: `1H Bullish OB $${fmt(bullOb1h.bottom)} - $${fmt(bullOb1h.top)}`, ob: bullOb1h, source: '1H OB' };
+          if (demand1h) return { low: demand1h.bottom || demand1h.price, high: demand1h.top || demand1h.price, label: `1H Demand/SNR $${fmt(demand1h.bottom || demand1h.price)} - $${fmt(demand1h.top || demand1h.price)}`, ob: undefined, source: '1H SNR' };
+        } else {
+          if (bearOb1h) return { low: bearOb1h.bottom, high: bearOb1h.top, label: `1H Bearish OB $${fmt(bearOb1h.bottom)} - $${fmt(bearOb1h.top)}`, ob: bearOb1h, source: '1H OB' };
+          if (supply1h) return { low: supply1h.bottom || supply1h.price, high: supply1h.top || supply1h.price, label: `1H Supply/SNR $${fmt(supply1h.bottom || supply1h.price)} - $${fmt(supply1h.top || supply1h.price)}`, ob: undefined, source: '1H SNR' };
+        }
+        return null;
+      };
+      const scoreCandidate = (side: 'LONG' | 'SHORT') => {
+        const zone1h = buildPrimaryZone(side);
+        if (!zone1h) return null;
+        const refinement = find15mRefinement(k15, current, zone1h, side);
+        const trigger = detect5mCandlestickTrigger(k5, refinement, side);
+        const dist1h = distanceToZonePct(current, zone1h.low, zone1h.high);
+        const distRef = distanceToZonePct(current, refinement.low, refinement.high);
+        const effectiveDist = Math.min(dist1h, distRef);
+        const htfBiasScore = side === 'LONG'
+          ? (structure4h.bias === 'BULLISH' ? 15 : structure4h.bias === 'RANGE' ? 5 : -14) + (structure1h.bias === 'BULLISH' ? 15 : structure1h.bias === 'RANGE' ? 5 : -12)
+          : (structure4h.bias === 'BEARISH' ? 15 : structure4h.bias === 'RANGE' ? 5 : -14) + (structure1h.bias === 'BEARISH' ? 15 : structure1h.bias === 'RANGE' ? 5 : -12);
+        const tfTrendScore = side === 'LONG'
+          ? (a4h.trend === 'BULLISH' ? 6 : a4h.trend === 'RANGE' ? 2 : -6) + (a1h.trend === 'BULLISH' ? 6 : a1h.trend === 'RANGE' ? 2 : -6)
+          : (a4h.trend === 'BEARISH' ? 6 : a4h.trend === 'RANGE' ? 2 : -6) + (a1h.trend === 'BEARISH' ? 6 : a1h.trend === 'RANGE' ? 2 : -6);
+        const obScore = zone1h.ob
+          ? (zone1h.ob.quality === 'STRONG' ? 20 : 14) + (!zone1h.ob.mitigated ? 10 : -8) + (zone1h.ob.strength > 70 ? 8 : 4)
+          : 10;
+        const zoneScore = effectiveDist === 0 ? 16 : effectiveDist <= alertRules.near ? 13 : effectiveDist <= alertRules.maxWatch ? 8 : 0;
+        const refineScore = refinement.score;
+        const triggerScore = trigger.score;
+        const latePenalty = trigger.late || effectiveDist > alertRules.maxWatch ? -25 : 0;
+        const htfPenalty = htfBiasScore < 0 ? -10 : 0;
+        const alignmentBonus = side === 'LONG'
+          ? (a15.trend === 'BULLISH' ? 5 : 0) + (a5.trend === 'BULLISH' ? 5 : 0) + (structure15.bias === 'BULLISH' ? 5 : 0)
+          : (a15.trend === 'BEARISH' ? 5 : 0) + (a5.trend === 'BEARISH' ? 5 : 0) + (structure15.bias === 'BEARISH' ? 5 : 0);
+        const score = clamp(htfBiasScore + tfTrendScore + obScore + zoneScore + refineScore + triggerScore + alignmentBonus + latePenalty + htfPenalty, 0, 100);
+        return {
+          side,
+          score,
+          effectiveDist,
+          zone1h,
+          refinement,
+          trigger,
+          htf: `${structure4h.bias}/${structure1h.bias}`,
+          triggerText: trigger.detail,
+          obQuality: obStatusText(zone1h.ob),
+          tfText: `15M ${a15.trend} • 5M ${a5.trend} • ${structure15.bias}`
+        };
+      };
+      const longCandidate = scoreCandidate('LONG');
+      const shortCandidate = scoreCandidate('SHORT');
+      const candidates = [longCandidate, shortCandidate].filter(Boolean) as any[];
+      if (!candidates.length) return null;
+      const sorted = candidates.sort((a, b) => b.score - a.score);
+      const best = sorted[0];
+      const second = sorted[1];
+      if (second && Math.abs(best.score - second.score) <= 6 && best.score < alertRules.minHitScore) return null;
+      if (best.effectiveDist > alertRules.maxWatch) return null;
+      if (best.score < alertRules.minWatchScore) return null;
+      let level: AlertItem['level'] = 'info';
+      let status = `${best.side} WATCH`;
+      let action = 'Pantau. Harga belum cukup dekat atau trigger belum valid.';
+      if (best.trigger.late) {
+        level = 'info';
+        status = `${best.side} LATE ENTRY`;
+        action = 'Trigger muncul tapi harga sudah menjauh. Hindari entry terlambat.';
+      } else if (best.effectiveDist === 0 && best.trigger.valid && best.score >= alertRules.minHitScore) {
+        level = 'hot';
+        status = `${best.side} TRIGGER VALID`;
+        action = `${best.side} valid selama harga belum jauh dari refinement zone.`;
+      } else if (best.effectiveDist === 0 && best.score >= alertRules.minNearScore) {
+        level = 'warn';
+        status = `${best.side} LIMIT READY`;
+        action = 'Harga sudah dalam 1H OB/refinement. Tunggu 5M trigger untuk confirmation entry.';
+      } else if (best.effectiveDist <= alertRules.near && best.score >= alertRules.minNearScore) {
+        level = 'warn';
+        status = `NEAR ${best.side} ENTRY`;
+        action = 'Harga mendekati 1H OB. Siapkan plan, tunggu reaksi 5M.';
+      } else if (best.trigger.valid && best.score >= alertRules.minWatchScore) {
+        level = 'ok';
+        status = `${best.side} TRIGGER WATCH`;
+        action = '5M mulai memberi trigger, tapi harga/zone belum ideal. Jangan kejar harga.';
+      } else {
+        if (best.score < alertRules.minWatchScore + 4) return null;
+        level = 'info';
+        status = `${best.side} NO TRIGGER`;
+        action = 'Zona ada, tapi 5M belum valid. Tunggu engulfing/rejection/displacement.';
+      }
+      if (level === 'info' && alertMode !== 'AGGRESSIVE') return null;
+      const exec = buildExecutionLevels(best.side, best.refinement, best.side === 'LONG' ? best.zone1h.low : best.zone1h.high);
+      return {
+        level,
+        title: `${symbol} • ${status}`,
+        message: `${best.zone1h.label} | ${best.refinement.label} | ${best.trigger.detail} | Score ${Math.round(best.score)}/100`,
+        symbol,
+        status,
+        distance: best.effectiveDist,
+        score: Math.round(best.score),
+        zone: best.zone1h.label,
+        zone1h: best.zone1h.label,
+        refinement: best.refinement.label,
+        htf: best.htf,
+        trigger: best.triggerText,
+        triggerPattern: best.trigger.pattern,
+        obQuality: best.obQuality,
+        side: best.side,
+        currentPrice: current,
+        entryAggressive: exec.aggressive,
+        entryMain: exec.main,
+        entryConservative: exec.conservative,
+        stopLoss: exec.stopLoss,
+        tp1: exec.tps[0],
+        tp2: exec.tps[1],
+        tp3: exec.tps[2],
+        telegramImageReady: symbol === selectedSymbol,
+        action
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const scanFavoriteRadar = async () => {
+    if (!favoriteRadarEnabled) {
+      setFavoriteRadarStatus('OFF');
+      return;
+    }
+    const favs = (favoriteCoins.length ? favoriteCoins : DEFAULT_WATCH.slice(0, 6)).slice(0, alertRules.scanLimit);
+    if (!favs.length) {
+      setFavoriteAlerts([]);
+      setFavoriteRadarStatus('IDLE');
+      return;
+    }
+    setFavoriteRadarStatus('SCANNING');
+    const results: AlertItem[] = [];
+    for (const symbol of favs) {
+      const item = await analyzeFavoriteSymbol(symbol);
+      if (item) results.push(item);
+      await new Promise(r => setTimeout(r, 80));
+    }
+    const sorted = results.sort((a, b) => {
+      const rank = { hot: 4, warn: 3, ok: 2, info: 1 };
+      return (rank[b.level] - rank[a.level]) || ((b.score || 0) - (a.score || 0));
+    }).slice(0, 10);
+    setFavoriteAlerts(sorted);
+    setFavoriteLastScan(Date.now());
+    setFavoriteRadarStatus('READY');
+  };
+
+  useEffect(() => {
+    scanFavoriteRadar();
+    const id = window.setInterval(scanFavoriteRadar, 45000);
+    return () => window.clearInterval(id);
+  }, [favoriteCoins.join(','), favoriteRadarEnabled, alertMode]);
+
+  const alerts: AlertItem[] = useMemo(() => {
+    const items: AlertItem[] = [];
+    if (!plan || apiStatus !== 'LIVE API') return [{ level: 'warn', title: 'LIVE API belum aktif', message: 'Tool dikunci tanpa demo data. Tekan Retry setelah koneksi stabil.' }];
+    if (wsStatus !== 'REALTIME ON') items.push({ level: 'warn', title: 'Realtime stream belum ON', message: 'Jika chart tidak bergerak, tekan Reset Stream.' });
+    if (plan.status.includes('VALID')) items.push({ level: 'hot', title: `${selectedSymbol} ${plan.status}`, message: `${sniperMode} mode. Confluence ${plan.confluenceScore || plan.confidence}/100.` });
+    else if (plan.status.includes('READY')) items.push({ level: 'ok', title: `${selectedSymbol} ${plan.status}`, message: 'Bias sudah terbentuk, tunggu harga masuk level entry.' });
+    else items.push({ level: 'info', title: `${selectedSymbol} ${plan.status}`, message: 'Belum ada edge bersih. Jangan paksa entry.' });
+    if (entryBullOb15 && isPriceNearZone(lastPrice, entryBullOb15.bottom, entryBullOb15.top, 0.8)) items.push({ level: 'ok', title: 'Price near 15M Bullish OB', message: `Harga dekat bullish OB ${entryBullOb15.quality}. Pantau reaksi demand.` });
+    if (entryBearOb15 && isPriceNearZone(lastPrice, entryBearOb15.bottom, entryBearOb15.top, 0.8)) items.push({ level: 'warn', title: 'Price near 15M Bearish OB', message: `Harga dekat bearish OB ${entryBearOb15.quality}. Pantau rejection supply.` });
+    if (entrySupport15 && isPriceNearZone(lastPrice, entrySupport15.bottom || entrySupport15.price, entrySupport15.top || entrySupport15.price, 0.7)) items.push({ level: 'ok', title: 'Price entering 15M support zone', message: `Support score ${entrySupport15.score || 0}.` });
+    if (entryResistance15 && isPriceNearZone(lastPrice, entryResistance15.bottom || entryResistance15.price, entryResistance15.top || entryResistance15.price, 0.7)) items.push({ level: 'warn', title: 'Price entering 15M resistance zone', message: `Resistance score ${entryResistance15.score || 0}.` });
+    if ((plan.confluenceScore || 0) >= 80) items.push({ level: 'hot', title: 'Confluence strong', message: `Score ${plan.confluenceScore}/100. Validasi candle + risk sebelum entry.` });
+    else if ((plan.confluenceScore || 0) >= 66) items.push({ level: 'ok', title: 'Confluence ready', message: `Score ${plan.confluenceScore}/100. Tunggu area entry.` });
+    if (Math.abs(oiChangePct) >= 3) items.push({ level: 'warn', title: 'OI ekstrem', message: `Open Interest berubah ${fmtPct(oiChangePct)} pada window 5m x30.` });
+    if (Math.abs(fundingRate) >= 0.0003) items.push({ level: 'warn', title: 'Funding ekstrem', message: `Funding ${(fundingRate * 100).toFixed(4)}%, potensi crowded side.` });
+    if (takerRatio > 1.15) items.push({ level: 'ok', title: 'Taker buy dominan', message: `Buy/Sell ratio ${takerRatio.toFixed(2)}.` });
+    if (takerRatio > 0 && takerRatio < 0.85) items.push({ level: 'warn', title: 'Taker sell dominan', message: `Buy/Sell ratio ${takerRatio.toFixed(2)}.` });
+    if (Math.abs(depthStats.imbalance) > 25) items.push({ level: 'info', title: 'Order wall berat sebelah', message: `${depthStats.imbalance.toFixed(1)}% depth imbalance. ${miniMap.magnet}` });
+    return items.slice(0, 9);
+  }, [plan, apiStatus, wsStatus, selectedSymbol, sniperMode, oiChangePct, fundingRate, takerRatio, depthStats.imbalance, miniMap.magnet, entryBullOb15, entryBearOb15, entrySupport15, entryResistance15, lastPrice]);
+
+  const combinedAlerts: AlertItem[] = useMemo(() => {
+    return favoriteAlerts.map(a => ({ ...a, title: a.title.startsWith('⭐') ? a.title : `⭐ ${a.title}` })).slice(0, 10);
+  }, [favoriteAlerts]);
+
+  // Canvas rendering
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !candles.length) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const rect = canvas.parentElement?.getBoundingClientRect();
+    const width = Math.max(320, rect?.width || 800);
+    const coarse = window.matchMedia('(pointer: coarse)').matches;
+    const height = isChartFullscreen
+      ? Math.max(420, window.innerHeight - 116)
+      : coarse ? Math.max(340, Math.min(470, width * 0.78)) : Math.max(420, Math.min(560, width * 0.48));
+    const dpr = Math.min(window.devicePixelRatio || 1, isChartFullscreen ? 1.8 : 1.7);
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = '#07101b';
+    ctx.fillRect(0, 0, width, height);
+    const margin = { top: 22, right: 78, bottom: 42, left: 10 };
+    const chartW = width - margin.left - margin.right;
+    const chartH = height - margin.top - margin.bottom;
+    const count = getChartVisibleCount();
+    const endIndex = Math.max(count, candles.length - chartPan);
+    const virtualRightBars = Math.max(0, endIndex - candles.length);
+    const active = candles.slice(Math.max(0, endIndex - count), Math.min(candles.length, endIndex));
+    const totalSlots = Math.max(1, active.length + virtualRightBars);
+    const startIndex = candles.indexOf(active[0]);
+    if (!active.length) return;
+    let minP = Math.min(...active.map(c => c.l));
+    let maxP = Math.max(...active.map(c => c.h));
+    const pad = (maxP - minP) * 0.1 || 1;
+    minP -= pad;
+    maxP += pad;
+    const autoMid = (minP + maxP) / 2;
+    const autoRange = Math.max(maxP - minP, Math.abs(autoMid) * 0.002 || 1);
+    const manualRange = autoRange * priceScale;
+    const manualMid = autoMid + priceOffset;
+    minP = manualMid - manualRange / 2;
+    maxP = manualMid + manualRange / 2;
+    const maxV = Math.max(...active.map(c => c.v)) || 1;
+    const x = (i: number) => margin.left + (i / Math.max(1, totalSlots - 1)) * chartW;
+    const y = (p: number) => margin.top + (1 - (p - minP) / (maxP - minP)) * chartH;
+
+    ctx.strokeStyle = '#183047';
+    ctx.lineWidth = 0.6;
+    for (let i = 0; i <= 5; i++) {
+      const p = minP + (i / 5) * (maxP - minP);
+      const yy = y(p);
+      ctx.beginPath(); ctx.moveTo(margin.left, yy); ctx.lineTo(margin.left + chartW, yy); ctx.stroke();
+      ctx.fillStyle = '#8aa0b8'; ctx.font = '10px monospace'; ctx.fillText(fmt(p, 2), margin.left + chartW + 7, yy + 3);
+    }
+
+    ctx.fillStyle = '#64748b';
+    ctx.font = '10px monospace';
+    for (let i = 0; i <= 4; i++) {
+      const idx = Math.floor((active.length - 1) * (i / 4));
+      const c = active[idx];
+      if (!c) continue;
+      const label = new Date(c.t).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      ctx.fillText(label, x(idx) - 16, height - 14);
+    }
+
+    if (chartLayers.ob) {
+      [...orderBlocks.bullish, ...orderBlocks.bearish].forEach(ob => {
+        if (ob.startIndex < startIndex || ob.startIndex > startIndex + active.length - 1) return;
+        const left = x(ob.startIndex - startIndex);
+        const top = y(ob.top);
+        const bottom = y(ob.bottom);
+        const boxColor = ob.type === 'BULLISH_OB' ? 'rgba(16,185,129,.12)' : 'rgba(239,68,68,.12)';
+        const stroke = ob.type === 'BULLISH_OB' ? 'rgba(16,185,129,.55)' : 'rgba(239,68,68,.55)';
+        ctx.fillStyle = boxColor;
+        ctx.fillRect(left, top, margin.left + chartW - left, bottom - top);
+        ctx.strokeStyle = stroke;
+        ctx.strokeRect(left, top, margin.left + chartW - left, bottom - top);
+        ctx.fillStyle = ob.type === 'BULLISH_OB' ? '#34d399' : '#fb7185';
+        ctx.font = 'bold 10px monospace';
+        ctx.fillText(ob.type === 'BULLISH_OB' ? 'BULL OB' : 'BEAR OB', left + 4, top + 12);
+      });
+    }
+
+    if (chartLayers.snr) {
+      const drawSrnZone = (zone: Zone | undefined, color: string, fill: string, label: string, index: number) => {
+        if (!zone) return;
+        const topPrice = zone.top || zone.price;
+        const bottomPrice = zone.bottom || zone.price;
+        if (topPrice < minP || bottomPrice > maxP) return;
+        const yTop = y(topPrice);
+        const yBottom = y(bottomPrice);
+        const yy = y(zone.price);
+        ctx.fillStyle = fill;
+        ctx.fillRect(margin.left, yTop, chartW, Math.max(2, yBottom - yTop));
+        ctx.strokeStyle = color;
+        ctx.lineWidth = index === 0 ? 1.25 : 0.8;
+        ctx.setLineDash(index === 0 ? [5, 4] : [3, 5]);
+        ctx.beginPath(); ctx.moveTo(margin.left, yy); ctx.lineTo(margin.left + chartW, yy); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color; ctx.font = index === 0 ? 'bold 10px monospace' : '9px monospace';
+        ctx.fillText(`${label}${index + 1} ${fmt(zone.price)} ${zone.kind === 'MAJOR' ? 'M' : 'A'} ${zone.score || 0}`, margin.left + 6, yy - 5);
+      };
+      zones.support.slice(0, 2).forEach((z, i) => drawSrnZone(z, '#10b981', 'rgba(16,185,129,.055)', 'SUP', i));
+      zones.resistance.slice(0, 2).forEach((z, i) => drawSrnZone(z, '#ef4444', 'rgba(239,68,68,.055)', 'RES', i));
+    }
+
+    if (chartLayers.walls) {
+      const maxNotional = Math.max(...depth.bids.map(d => d.notional), ...depth.asks.map(d => d.notional), 1);
+      depth.bids.slice(0, 35).forEach(b => {
+        if (b.price < minP || b.price > maxP) return;
+        const yy = y(b.price);
+        const w = Math.min(70, (b.notional / maxNotional) * 70);
+        ctx.fillStyle = 'rgba(16,185,129,.16)';
+        ctx.fillRect(margin.left + chartW - w, yy - 1.4, w, 2.8);
+      });
+      depth.asks.slice(0, 35).forEach(a => {
+        if (a.price < minP || a.price > maxP) return;
+        const yy = y(a.price);
+        const w = Math.min(70, (a.notional / maxNotional) * 70);
+        ctx.fillStyle = 'rgba(239,68,68,.16)';
+        ctx.fillRect(margin.left + chartW - w, yy - 1.4, w, 2.8);
+      });
+    }
+
+    active.forEach((c, i) => {
+      const xx = x(i);
+      const bull = c.c >= c.o;
+      const color = bull ? '#22c55e' : '#ef4444';
+      const yo = y(c.o), yc = y(c.c), yh = y(c.h), yl = y(c.l);
+      const cw = Math.max(2.5, (chartW / active.length) * 0.62);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(xx, yh); ctx.lineTo(xx, yl); ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.fillRect(xx - cw / 2, Math.min(yo, yc), cw, Math.max(1, Math.abs(yo - yc)));
+      const vh = (c.v / maxV) * (chartH * 0.14);
+      ctx.fillStyle = bull ? 'rgba(34,197,94,.12)' : 'rgba(239,68,68,.12)';
+      ctx.fillRect(xx - cw / 2, margin.top + chartH - vh, cw, vh);
+    });
+
+    if (chartLayers.structure) {
+      chartStructure.points.forEach(pt => {
+        if (pt.index < startIndex || pt.index > startIndex + active.length - 1 || pt.price < minP || pt.price > maxP) return;
+        const xx = x(pt.index - startIndex);
+        const yy = y(pt.price);
+        const color = pt.side === 'high' ? '#f59e0b' : '#38bdf8';
+        ctx.beginPath(); ctx.fillStyle = color; ctx.arc(xx, yy, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = color; ctx.font = 'bold 10px monospace'; ctx.fillText(pt.label, xx + 5, pt.side === 'high' ? yy - 6 : yy + 12);
+      });
+      chartStructure.events.forEach(ev => {
+        if (ev.index < startIndex || ev.index > startIndex + active.length - 1 || ev.price < minP || ev.price > maxP) return;
+        const xx = x(ev.index - startIndex);
+        const yy = y(ev.price);
+        const color = ev.label.includes('UP') ? '#34d399' : '#fb7185';
+        ctx.strokeStyle = color;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath(); ctx.moveTo(xx, margin.top); ctx.lineTo(xx, margin.top + chartH); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color; ctx.font = 'bold 10px monospace'; ctx.fillText(ev.label, xx + 4, yy + (ev.label.includes('UP') ? -8 : 12));
+      });
+    }
+
+    const lp = lastPrice || active[active.length - 1].c;
+    const ly = y(lp);
+    ctx.strokeStyle = '#e2e8f0';
+    ctx.setLineDash([6, 4]);
+    ctx.beginPath(); ctx.moveTo(margin.left, ly); ctx.lineTo(margin.left + chartW, ly); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#0f172a'; ctx.fillRect(margin.left + chartW + 3, ly - 9, 72, 18);
+    ctx.fillStyle = '#f8fafc'; ctx.font = 'bold 10px monospace'; ctx.fillText(fmt(lp, 2), margin.left + chartW + 7, ly + 4);
+
+    if (hover) {
+      const hoverIdx = active.findIndex(c => c.t === hover.t);
+      if (hoverIdx >= 0) {
+        const xx = x(hoverIdx);
+        const yy = y(hover.c);
+        ctx.strokeStyle = 'rgba(226,232,240,.55)';
+        ctx.lineWidth = 0.8;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(xx, margin.top); ctx.lineTo(xx, margin.top + chartH); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(margin.left, yy); ctx.lineTo(margin.left + chartW, yy); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+  }, [candles, depth, zoom, chartPan, priceScale, priceOffset, isChartFullscreen, nearestSupport, nearestResistance, zones, lastPrice, orderBlocks, chartStructure, chartLayers, hover, chartSetupZones, favoriteAlerts, selectedSymbol, plan]);
+
+  const getVisibleCandles = () => {
+    const count = getChartVisibleCount();
+    const endIndex = Math.max(count, candles.length - chartPan);
+    return candles.slice(Math.max(0, endIndex - count), Math.min(candles.length, endIndex));
+  };
+
+  const getVisiblePriceRange = () => {
+    const active = getVisibleCandles();
+    if (!active.length) return { min: 0, max: 1, range: 1 };
+    let min = Math.min(...active.map(c => c.l));
+    let max = Math.max(...active.map(c => c.h));
+    const pad = (max - min) * 0.1 || 1;
+    min -= pad;
+    max += pad;
+    const autoMid = (min + max) / 2;
+    const autoRange = Math.max(max - min, Math.abs(autoMid) * 0.002 || 1);
+    const range = autoRange * priceScale;
+    const mid = autoMid + priceOffset;
+    return { min: mid - range / 2, max: mid + range / 2, range };
+  };
+
+  const isPriceScaleArea = (clientX: number, rect: DOMRect) => clientX - rect.left >= rect.width - 82;
+  const getChartVisibleCount = () => Math.max(isChartFullscreen ? 58 : 46, Math.floor((isChartFullscreen ? 170 : 130) * (100 / zoom)));
+  const maxPanValue = () => Math.max(0, candles.length - 40);
+  const minPanValue = () => -Math.max(10, Math.floor(getChartVisibleCount() * 0.48));
+
+  const applyHorizontalPan = (dx: number, candlePx: number) => {
+    const threshold = Math.max(3, candlePx * 0.28);
+    if (Math.abs(dx) < threshold) return false;
+    const step = Math.sign(dx) * Math.max(1, Math.round(Math.abs(dx) / Math.max(1, candlePx)));
+    setChartPan(p => clamp(p + step, minPanValue(), maxPanValue()));
+    return true;
+  };
+
+  const centerLastCandle = () => {
+    setChartPan(minPanValue());
+  };
+
+  const onCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!candles.length) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const isPrice = isPriceScaleArea(e.clientX, rect);
+    mouseDragRef.current = { active: true, lastX: e.clientX, lastY: e.clientY, mode: isPrice ? 'price' : 'pan' };
+  };
+
+  const stopCanvasMouseDrag = () => {
+    mouseDragRef.current = { active: false, lastX: 0, lastY: 0, mode: null };
+  };
+
+  const onCanvasMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!candles.length) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const xPos = e.clientX - rect.left;
+    const active = getVisibleCandles();
+    const idx = clamp(Math.floor((xPos / rect.width) * active.length), 0, active.length - 1);
+    if (mouseDragRef.current.active) {
+      const dx = e.clientX - mouseDragRef.current.lastX;
+      const dy = e.clientY - mouseDragRef.current.lastY;
+      const candlePx = rect.width / Math.max(1, active.length);
+      if (mouseDragRef.current.mode === 'price') {
+        setPriceScale(s => clamp(s * (1 + dy * 0.006), 0.35, 4.5));
+        mouseDragRef.current.lastY = e.clientY;
+      } else {
+        if (mouseDragRef.current.mode === 'pan' && Math.abs(dy) > Math.abs(dx) * 1.45 && Math.abs(dy) > 6) {
+          mouseDragRef.current.mode = 'vertical';
+        }
+        if (mouseDragRef.current.mode === 'vertical') {
+          const range = getVisiblePriceRange().range;
+          setPriceOffset(o => o + (dy / Math.max(1, rect.height)) * range);
+          mouseDragRef.current.lastY = e.clientY;
+        } else if (applyHorizontalPan(dx, candlePx)) {
+          mouseDragRef.current.lastX = e.clientX;
+        }
+      }
+    }
+    setHover(active[idx]);
+  };
+
+  const onCanvasTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (e.touches.length === 1) {
+      const rect = e.currentTarget.getBoundingClientRect();
+      const isPrice = isPriceScaleArea(e.touches[0].clientX, rect);
+      touchRef.current = { lastX: e.touches[0].clientX, lastY: e.touches[0].clientY, lastDistance: 0, mode: isPrice ? 'price' : 'pan' };
+      const active = getVisibleCandles();
+      const idx = clamp(Math.floor(((e.touches[0].clientX - rect.left) / rect.width) * active.length), 0, active.length - 1);
+      setHover(active[idx]);
+    } else if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchRef.current = { lastX: 0, lastY: 0, lastDistance: Math.hypot(dx, dy), mode: 'pinch' };
+    }
+  };
+
+  const onCanvasTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (!candles.length) return;
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    const active = getVisibleCandles();
+    if (e.touches.length === 1) {
+      const xNow = e.touches[0].clientX;
+      const yNow = e.touches[0].clientY;
+      const dx = xNow - touchRef.current.lastX;
+      const dy = yNow - touchRef.current.lastY;
+      const candlePx = rect.width / Math.max(1, active.length);
+      if (touchRef.current.mode === 'price') {
+        setPriceScale(s => clamp(s * (1 + dy * 0.006), 0.35, 4.5));
+        touchRef.current.lastY = yNow;
+        return;
+      }
+      if (touchRef.current.mode === 'pan' && Math.abs(dy) > Math.abs(dx) * 1.45 && Math.abs(dy) > 6) {
+        touchRef.current.mode = 'vertical';
+      }
+      if (touchRef.current.mode === 'vertical') {
+        const range = getVisiblePriceRange().range;
+        setPriceOffset(o => o + (dy / Math.max(1, rect.height)) * range);
+        touchRef.current.lastY = yNow;
+      } else {
+        if (applyHorizontalPan(dx, candlePx)) {
+          touchRef.current.lastX = xNow;
+        }
+      }
+      const idx = clamp(Math.floor(((xNow - rect.left) / rect.width) * active.length), 0, active.length - 1);
+      setHover(active[idx]);
+    } else if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      const last = touchRef.current.lastDistance || dist;
+      const diff = dist - last;
+      if (Math.abs(diff) > 12) {
+        setZoom(z => clamp(z - diff * 0.18, 50, 260));
+        touchRef.current.lastDistance = dist;
+        touchRef.current.mode = 'pinch';
+      }
+    }
+  };
+
+  const onCanvasTouchEnd = () => {
+    touchRef.current = { lastX: 0, lastY: 0, lastDistance: 0, mode: null };
+  };
+
+  const resetPriceScale = () => {
+    setPriceScale(1);
+    setPriceOffset(0);
+  };
+
+  const resetChartView = () => {
+    setChartPan(0);
+    setZoom(100);
+    resetPriceScale();
+    setHover(null);
+  };
+
+  useEffect(() => {
+    setChartPan(0);
+    resetPriceScale();
+    setHover(null);
+  }, [selectedSymbol, interval]);
+
+  const resetStream = () => {
+    setWsStatus('CONNECTING');
+    setStreamResetKey(k => k + 1);
+    loadSymbol(selectedSymbol);
+  };
+
+  const enableSound = async () => {
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
+      await audioCtxRef.current.resume();
+      setSoundEnabled(true);
+      playAlertSound('ok', true);
+    } catch {
+      alert('Sound tidak bisa diaktifkan browser.');
+    }
+  };
+
+  const playTone = (ctx: AudioContext, freq: number, startAt: number, duration = 0.28, type: OscillatorType = 'sine') => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.001, startAt);
+    gain.gain.exponentialRampToValueAtTime(0.09, startAt + 0.025);
+    gain.gain.exponentialRampToValueAtTime(0.001, startAt + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(startAt);
+    osc.stop(startAt + duration + 0.03);
+  };
+
+  const playAlertSound = (tone: 'hot' | 'warn' | 'ok' = 'ok', force = false) => {
+    if (!soundEnabled && !force) return;
+    const now = Date.now();
+    if (!force && now - lastSoundRef.current < 20000) return;
+    lastSoundRef.current = now;
+    try {
+      const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = audioCtxRef.current || new Ctx();
+      audioCtxRef.current = ctx;
+      const t = ctx.currentTime + 0.02;
+      if (tone === 'hot') {
+        [880, 1040, 1180, 1040, 880].forEach((f, i) => playTone(ctx, f, t + i * 0.24, 0.18, 'square'));
+        setTimeout(() => { try { [880, 1180, 1320].forEach((f, i) => playTone(ctx, f, ctx.currentTime + i * 0.22, 0.18, 'square')); } catch {} }, 1500);
+      } else if (tone === 'warn') {
+        [660, 760, 660, 760].forEach((f, i) => playTone(ctx, f, t + i * 0.30, 0.22, 'sine'));
+      } else {
+        [520, 660].forEach((f, i) => playTone(ctx, f, t + i * 0.22, 0.16, 'sine'));
+      }
+      if (navigator.vibrate) {
+        navigator.vibrate(tone === 'hot' ? [350,120,350,120,500,200,350] : tone === 'warn' ? [250,100,250,100,250] : [120,80,120]);
+      }
+    } catch {}
+  };
+
+  const buildTelegramSimpleCaption = (a: AlertItem) => {
+    const priceText = typeof a.currentPrice === 'number' ? `$${fmt(a.currentPrice)}` : `$${fmt(lastPrice || markPrice)}`;
+    const tpText = [
+      typeof a.tp1 === 'number' ? `$${fmt(a.tp1)}` : '-',
+      typeof a.tp2 === 'number' ? `$${fmt(a.tp2)}` : '-',
+      typeof a.tp3 === 'number' ? `$${fmt(a.tp3)}` : '-'
+    ].join(' / ');
+    return [
+      `🎯 ${a.symbol || selectedSymbol} • ${a.status || a.title}`,
+      `Price: ${priceText}`,
+      `Entry: A ${typeof a.entryAggressive === 'number' ? `$${fmt(a.entryAggressive)}` : '-'} • M ${typeof a.entryMain === 'number' ? `$${fmt(a.entryMain)}` : '-'} • C ${typeof a.entryConservative === 'number' ? `$${fmt(a.entryConservative)}` : '-'}`,
+      `SL: ${typeof a.stopLoss === 'number' ? `$${fmt(a.stopLoss)}` : '-'}`,
+      `TP: ${tpText}`,
+      `Score: ${a.score ?? '-'}/100`
+    ].join('\n');
+  };
+
+  const captureChartBlob = async () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    return await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+  };
+
+  const sendTelegramAlert = async (a: AlertItem) => {
+    if (!telegramEnabled || !telegramBotToken.trim() || !telegramChatId.trim()) {
+      setTelegramStatus(telegramEnabled ? 'ERROR' : 'OFF');
+      return;
+    }
+    const key = `${a.symbol || selectedSymbol}|${a.status || a.title}|${a.zone1h || a.zone || ''}|${a.refinement || ''}|${a.triggerPattern || ''}`;
+    const now = Date.now();
+    if (sentTelegramRef.current[key] && now - sentTelegramRef.current[key] < 15 * 60 * 1000) return;
+    sentTelegramRef.current[key] = now;
+    try {
+      setTelegramStatus('SENDING');
+      const caption = buildTelegramSimpleCaption(a);
+      const shouldSendChart = telegramMode === 'TEXT + CHART' && (a.telegramImageReady || (a.symbol || selectedSymbol) === selectedSymbol);
+      if (shouldSendChart) {
+        const chartBlob = await captureChartBlob();
+        if (chartBlob) {
+          const fd = new FormData();
+          fd.append('chat_id', telegramChatId.trim());
+          fd.append('caption', caption);
+          fd.append('photo', chartBlob, `${a.symbol || selectedSymbol}_${Date.now()}.jpg`);
+          const photoRes = await fetch(`https://api.telegram.org/bot${telegramBotToken.trim()}/sendPhoto`, {
+            method: 'POST',
+            body: fd
+          });
+          if (photoRes.ok) {
+            setTelegramStatus('SENT');
+            return;
+          }
+        }
+      }
+      const textRes = await fetch(`https://api.telegram.org/bot${telegramBotToken.trim()}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: telegramChatId.trim(),
+          text: caption,
+          disable_web_page_preview: true
+        })
+      });
+      if (!textRes.ok) throw new Error('Telegram rejected text request');
+      setTelegramStatus('SENT');
+    } catch {
+      setTelegramStatus('ERROR');
+    }
+  };
+
+  const testTelegramAlert = async () => {
+    await sendTelegramAlert({
+      level: 'ok',
+      title: `${selectedSymbol} • TEST TELEGRAM`,
+      message: 'Test alert dari Sniper Entry Detector. Jika pesan ini masuk, Telegram sudah READY.',
+      symbol: selectedSymbol,
+      status: 'TEST TELEGRAM',
+      score: 100,
+      distance: 0,
+      zone: 'Telegram test message',
+      zone1h: chartSetupZones.longSetup?.label || chartSetupZones.shortSetup?.label || '1H test zone',
+      refinement: plan?.entryZone ? `$${fmt(plan.entryZone[0])} - $${fmt(plan.entryZone[1])}` : '15M test refinement',
+      trigger: plan?.trigger || '5M test trigger',
+      triggerPattern: 'Test pattern',
+      obQuality: 'Test quality',
+      currentPrice: lastPrice || markPrice,
+      entryAggressive: selectedExecution?.aggressive,
+      entryMain: selectedExecution?.main,
+      entryConservative: selectedExecution?.conservative,
+      stopLoss: selectedExecution?.stopLoss,
+      tp1: selectedExecution?.tps[0],
+      tp2: selectedExecution?.tps[1],
+      tp3: selectedExecution?.tps[2],
+      telegramImageReady: true
+    });
+  };
+
+  const copyPlan = async () => {
+    try {
+      await navigator.clipboard.writeText(copyText);
+      alert('Sniper plan berhasil di-copy.');
+    } catch {
+      alert(copyText);
+    }
+  };
+
+  const exportAnalysisText = () => {
+    const blob = new Blob([copyText], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${selectedSymbol}_sniper_analysis_${new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const saveChartImage = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return alert('Chart belum siap.');
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${selectedSymbol}_${interval}_chart_${new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')}.png`;
+    a.click();
+  };
+
+  const clearPlanHistory = () => setPlanHistory([]);
+
+  const apiBadgeClass = apiStatus === 'LIVE API' ? 'ok' : apiStatus === 'CHECKING' ? 'warn' : 'bad';
+  const statusTone = plan?.status.includes('LONG') ? 'longTone' : plan?.status.includes('SHORT') ? 'shortTone' : 'waitTone';
+
+  return (
+    <div className="app">
+      <header className="topbar brandTopbar">
+        <div className="brand">
+          <div className="brandIcon logoFrame">
+            <div style={{width: 48, height: 48, background: "#22c55e", borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center"}}><span style={{color: "#0f172a", fontWeight: "bold", fontSize: 24}}>S</span></div>
+          </div>
+          <div>
+            <h1>SNIPER ENTRY DETECTOR</h1>
+            <p className="brandSubtitle">v4.6.2 • Telegram Simple Mode</p>
+          </div>
+        </div>
+        <div className="statusWrap">
+          <span className={`status ${apiBadgeClass}`}>{apiStatus}</span>
+          <button className="miniBtn" onClick={() => loadSymbol(selectedSymbol)} disabled={loading}>
+            <RefreshCw size={13} className={loading ? 'spin' : ''} /> Retry
+          </button>
+          <button className="miniBtn" onClick={resetStream}>
+            <Zap size={13} /> Reset Stream
+          </button>
+        </div>
+      </header>
+
+      <main className="layout">
+        <div className="topGrid">
+          <aside className="side panel">
+            <div className="sectionTitle"><Database size={15} /> Market</div>
+            <div className="searchBox">
+              <Search size={14} />
+              <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Cari BTC, SOL, SUI..." />
+            </div>
+            <div className="favoriteBar">
+              <button className={showFavoritesOnly ? 'favToggle active' : 'favToggle'} onClick={() => setShowFavoritesOnly(v => !v)}>⭐ Favorites</button>
+              <button className="favToggle" onClick={() => toggleFavorite(selectedSymbol)}>{favoriteSet.has(selectedSymbol) ? '★ Remove' : '☆ Add Current'}</button>
+            </div>
+            <div className="symbolGrid scrollSymbols">
+              {filteredSymbols.map(s => (
+                <div key={s.symbol} className={selectedSymbol === s.symbol ? 'symbolWrap active' : 'symbolWrap'}>
+                  <button className="symbolMain" onClick={() => setSelectedSymbol(s.symbol)}>{s.symbol.replace('USDT', '')}</button>
+                  <button className={favoriteSet.has(s.symbol) ? 'starBtn active' : 'starBtn'} onClick={() => toggleFavorite(s.symbol)}>{favoriteSet.has(s.symbol) ? '★' : '☆'}</button>
+                </div>
+              ))}
+            </div>
+            <div className="sectionTitle mt"><SlidersHorizontal size={15} /> Settings</div>
+            <div className="settingsRow modeRow"><span>Sniper Mode</span><select value={sniperMode} onChange={e => setSniperMode(e.target.value as SniperMode)}>{['AGGRESSIVE', 'NORMAL', 'CONSERVATIVE'].map(m => <option key={m}>{m}</option>)}</select></div>
+            <div className="settingsRow modeRow"><span>Alert Mode</span><select value={alertMode} onChange={e => setAlertMode(e.target.value as AlertMode)}>{['AGGRESSIVE', 'NORMAL', 'STRICT'].map(m => <option key={m}>{m}</option>)}</select></div>
+            <div className="settingsHint">Aggressive banyak pantauan, Normal balance, Strict hanya zona terbaik.</div>
+            <div className="settingsRow"><span>Live Sync 30s</span><button className={liveSync ? 'toggle on' : 'toggle'} onClick={() => setLiveSync(v => !v)}><span /></button></div>
+            <div className="settingsRow"><span>Telegram Alert</span><button className={telegramEnabled ? 'toggle on' : 'toggle'} onClick={() => setTelegramEnabled(v => !v)}><span /></button></div>
+            <div className="settingsRow"><span>Important Only</span><button className={telegramImportantOnly ? 'toggle on' : 'toggle'} onClick={() => setTelegramImportantOnly(v => !v)}><span /></button></div>
+            {telegramEnabled && <div className="telegramBox">
+              <div className="settingsRow modeRow compact"><span>Telegram Mode</span><select value={telegramMode} onChange={e => setTelegramMode(e.target.value as 'TEXT ONLY' | 'TEXT + CHART')}><option>TEXT ONLY</option><option>TEXT + CHART</option></select></div>
+              <input value={telegramBotToken} onChange={e => setTelegramBotToken(e.target.value)} placeholder="Telegram Bot Token" type="password" />
+              <input value={telegramChatId} onChange={e => setTelegramChatId(e.target.value)} placeholder="Telegram Chat ID" />
+              <small className="telegramHint">Simple Mode: TEXT + CHART mengirim 1 gambar chart + caption entry ringkas.</small>
+              <div className="telegramStatusRow">
+                <small>Status: <b className={telegramStatus === 'READY' || telegramStatus === 'SENT' ? 'green' : telegramStatus === 'ERROR' ? 'red' : ''}>{telegramStatus}</b></small>
+                <button className="tinyBtn" onClick={testTelegramAlert}>Test</button>
+              </div>
+            </div>}
+            {apiError && <div className="errorBox"><AlertTriangle size={14} /> {apiError}</div>}
+          </aside>
+
+          <section className="panel topAlertPanel">
+            <div className="topAlertHeader">
+              <div>
+                <div className="sectionTitle"><BellRing size={15} /> Favorite Alert Center</div>
+                <small className="radarMeta">Radar {favoriteRadarStatus} • Mode {alertMode} • Telegram {telegramEnabled ? telegramStatus : 'OFF'} • {favoriteCoins.length || DEFAULT_WATCH.slice(0, 6).length} coin • {favoriteLastScan ? new Date(favoriteLastScan).toLocaleTimeString('id-ID', {hour:'2-digit', minute:'2-digit'}) : '-'}</small>
+              </div>
+              <div className="radarActions">
+                <button className={favoriteRadarEnabled ? 'radarBtn active' : 'radarBtn'} onClick={() => setFavoriteRadarEnabled(v => !v)}>{favoriteRadarEnabled ? 'Radar ON' : 'Radar OFF'}</button>
+                <button className={soundEnabled ? 'radarBtn active' : 'radarBtn'} onClick={enableSound}>{soundEnabled ? 'Sound ON' : 'Enable Sound'}</button>
+                <span>{combinedAlerts.length} alert</span>
+              </div>
+            </div>
+            <div className="topAlertList favoriteAlertList">
+              {combinedAlerts.length === 0 ? <div className="emptyState">Belum ada favorite coin yang masuk zona entry.</div> : combinedAlerts.slice(0, 10).map((a, idx) => (
+                <button key={`top-${a.title}-${idx}`} className={`topAlertItem detailAlert ${a.level} ${a.symbol ? 'clickable' : ''}`} onClick={() => a.symbol && setSelectedSymbol(a.symbol)}>
+                  <span className="alertIcon">{a.level === 'hot' ? '🔥' : a.level === 'warn' ? '️' : a.level === 'ok' ? '✅' : 'ℹ️'}</span>
+                  <div className="alertBody">
+                    <div className="alertTitleRow"><b>{a.title}</b><em>{a.score ? `${a.score}/100` : '-'}</em></div>
+                    <small><strong>1H Zone:</strong> {a.zone1h || a.zone || '-'}</small>
+                    {a.refinement && <small><strong>15M Refine:</strong> {a.refinement}</small>}
+                    <div className="alertMetaGrid v42Meta">
+                      <i>Distance: {typeof a.distance === 'number' ? (a.distance === 0 ? 'Inside' : `${a.distance.toFixed(2)}%`) : '-'}</i>
+                      <i>HTF: {a.htf || '-'}</i>
+                      <i>OB: {a.obQuality || '-'}</i>
+                      <i>5M: {a.trigger || '-'}</i>
+                    </div>
+                    {(typeof a.entryMain === 'number' || typeof a.stopLoss === 'number') && <div className="alertPlanLine">
+                      <small><strong>Entry:</strong> A {typeof a.entryAggressive === 'number' ? `$${fmt(a.entryAggressive)}` : '-'} • M {typeof a.entryMain === 'number' ? `$${fmt(a.entryMain)}` : '-'} • C {typeof a.entryConservative === 'number' ? `$${fmt(a.entryConservative)}` : '-'}</small>
+                      <small><strong>SL/TP:</strong> {typeof a.stopLoss === 'number' ? `$${fmt(a.stopLoss)}` : '-'} | {typeof a.tp1 === 'number' ? `$${fmt(a.tp1)}` : '-'} | {typeof a.tp2 === 'number' ? `$${fmt(a.tp2)}` : '-'} | {typeof a.tp3 === 'number' ? `$${fmt(a.tp3)}` : '-'}</small>
+                    </div>}
+                    {a.action && <p>{a.action}</p>}
+                  </div>
+                </button>
+              ))}
+            </div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+        </div>
+
+        <section className="content">
+          <div className="hero panel">
+            <div>
+              <div className="pair">{selectedSymbol}</div>
+              <div className="muted">Last update: {lastUpdated ? new Date(lastUpdated).toLocaleTimeString('id-ID') : '-'}</div>
+            </div>
+            <div className="priceBlock"><div className="bigPrice">${fmt(lastPrice || markPrice, 2)}</div><div className={priceChange24h >= 0 ? 'green' : 'red'}>{fmtPct(priceChange24h)} 24h</div></div>
+            <div className="metricStrip">
+              <div><span>Mark</span><b>${fmt(markPrice, 2)}</b></div>
+              <div><span>Funding</span><b className={fundingRate >= 0 ? 'green' : 'red'}>{(fundingRate * 100).toFixed(4)}%</b></div>
+              <div><span>OI</span><b>{fmtShort(oiNow)}</b></div>
+              <div><span>Flow</span><b className={flow.bias === 'BULLISH' ? 'green' : flow.bias === 'BEARISH' ? 'red' : ''}>{flow.flowScore}/100</b></div>
+              <div><span>WS</span><b className={wsStatus === 'REALTIME ON' ? 'green' : wsStatus === 'CONNECTING' ? '' : 'red'}>{wsStatus}</b></div>
+              <div><span>Mode</span><b>{sniperMode}</b></div>
+              <div><span>Entry Anchor</span><b>1H / 15M / 5M</b></div>
+            </div>
+          </div>
+
+          <nav className="quickNav">
+            <a href="#chart"><LineChart size={14} /> Chart</a>
+            <a href="#sniper"><ShieldAlert size={14} /> Sniper</a>
+            <a href="#history"><Clipboard size={14} /> History</a>
+            <a href="#flow"><Gauge size={14} /> Flow</a>
+            <a href="#minimap"><BarChart3 size={14} /> Mini Map</a>
+            <a href="#scanner"><Flame size={14} /> Scanner</a>
+        <a href="#backtest"><Activity size={14} /> Backtest</a>
+          </nav>
+
+          <section id="chart" className={`panel chartPanel chartFirst ${isChartFullscreen ? 'fullscreenChart' : ''}`}>
+            <div className="chartHeader">
+              <div><div className="sectionTitle"><LineChart size={15} /> Professional Chart</div><p className="muted small">Chart overlay v4.6.2: Telegram Simple Mode, hanya chart + entry sniper ringkas.</p></div>
+              <div className="chartControlWrap">
+                <div className="chartControlBlock">
+                  <span className="chartControlLabel">Timeframe</span>
+                  <div className="tfButtons">{['1m','5m','15m','1h','4h','1d'].map(tf => <button key={tf} className={interval === tf ? 'tf active' : 'tf'} onClick={() => setIntervalState(tf)}>{tf}</button>)}</div>
+                </div>
+                <div className="chartActionRow">
+                  <button className="layerBtn active" onClick={() => setIsChartFullscreen(v => !v)}>{isChartFullscreen ? <Minimize2 size={13} /> : <Maximize2 size={13} />} {isChartFullscreen ? 'Exit' : 'Fullscreen'}</button>
+                  <button className="layerBtn" onClick={resetPriceScale}>Auto Scale</button>
+                  <button className="layerBtn" onClick={resetChartView}>Reset View</button>
+                  <button className="layerBtn" onClick={centerLastCandle}>Center Last</button>
+                  <div className="chartZoomInline"><span>Zoom</span><input type="range" min="60" max="220" value={zoom} onChange={e => setZoom(Number(e.target.value))} /><b>{zoom}%</b></div>
+                  <span className="touchHint">Drag kiri agar candle terakhir ke tengah • Center Last • Drag price scale kanan • Pinch zoom</span>
+                </div>
+                <div className="layerToggles">
+                  <button className={chartLayers.snr ? 'layerBtn active' : 'layerBtn'} onClick={() => setChartLayers(s => ({ ...s, snr: !s.snr }))}>SNR</button>
+                  <button className={chartLayers.ob ? 'layerBtn active' : 'layerBtn'} onClick={() => setChartLayers(s => ({ ...s, ob: !s.ob }))}>OB</button>
+                  <button className={chartLayers.structure ? 'layerBtn active' : 'layerBtn'} onClick={() => setChartLayers(s => ({ ...s, structure: !s.structure }))}>Structure</button>
+                  <button className={chartLayers.walls ? 'layerBtn active' : 'layerBtn'} onClick={() => setChartLayers(s => ({ ...s, walls: !s.walls }))}>Walls</button>
+                </div>
+              </div>
+            </div>
+            <div className="canvasWrap proChart">
+              {loading && <div className="loading"><RefreshCw className="spin" /> Mengambil Binance Live API...</div>}
+              <canvas
+                ref={canvasRef}
+                onMouseDown={onCanvasMouseDown}
+                onMouseMove={onCanvasMove}
+                onMouseUp={stopCanvasMouseDrag}
+                onMouseLeave={() => { setHover(null); stopCanvasMouseDrag(); }}
+                onTouchStart={onCanvasTouchStart}
+                onTouchMove={onCanvasTouchMove}
+                onTouchEnd={onCanvasTouchEnd}
+              />
+              {hover && <div className="hoverBox">O {fmt(hover.o)} • H {fmt(hover.h)} • L {fmt(hover.l)} • C {fmt(hover.c)} • V {fmt(hover.v,0)}</div>}
+            </div>
+            <div className="mtfGrid compactCards">
+              {mtfAnalysis.map(t => <div key={t.tf} className="tfCard"><span>{t.tf}</span><b className={t.trend === 'BULLISH' ? 'greenText' : t.trend === 'BEARISH' ? 'redText' : ''}>{t.trend}</b><small>{t.momentum.toFixed(2)}% • {t.volumeState}</small></div>)}
+            </div>
+            <div className="overlayInfoGrid">
+              <div className="infoCard"><span>Structure Now</span><b className={chartStructure.bias === 'BULLISH' ? 'greenText' : chartStructure.bias === 'BEARISH' ? 'redText' : ''}>{chartStructure.bias}</b><small>{chartStructure.summary}</small></div>
+              <div className="infoCard"><span>Nearest Bullish OB</span><b>{nearestBullOb ? `$${fmt(nearestBullOb.bottom)} - $${fmt(nearestBullOb.top)}` : '-'}</b><small>{nearestBullOb ? `Quality ${nearestBullOb.quality} | Strength ${nearestBullOb.strength.toFixed(0)} | ${nearestBullOb.mitigated ? 'Mitigated' : 'Fresh'}` : 'Belum ada bullish OB kuat'}</small></div>
+              <div className="infoCard"><span>Nearest Bearish OB</span><b>{nearestBearOb ? `$${fmt(nearestBearOb.bottom)} - $${fmt(nearestBearOb.top)}` : '-'}</b><small>{nearestBearOb ? `Quality ${nearestBearOb.quality} | Strength ${nearestBearOb.strength.toFixed(0)} | ${nearestBearOb.mitigated ? 'Mitigated' : 'Fresh'}` : 'Belum ada bearish OB kuat'}</small></div>
+              <div className="infoCard"><span>SNR Engine v2</span><b>{nearestSupport ? `$${fmt(nearestSupport.bottom || nearestSupport.price)} - $${fmt(nearestSupport.top || nearestSupport.price)}` : '-'} / {nearestResistance ? `$${fmt(nearestResistance.bottom || nearestResistance.price)} - $${fmt(nearestResistance.top || nearestResistance.price)}` : '-'}</b><small>Major TF {majorTf} + Active TF {interval} | score-based zone</small></div>
+            </div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+
+          <section className="panel structurePanel">
+            <div className="sectionTitle"><Target size={15} /> Order Block & Market Structure</div>
+            <div className="structureGrid">
+              <div className="structureCard"><span>4H Structure</span><b className={structure4h.bias === 'BULLISH' ? 'greenText' : structure4h.bias === 'BEARISH' ? 'redText' : ''}>{structure4h.bias}</b><small>{structure4h.summary}</small></div>
+              <div className="structureCard"><span>1H Structure</span><b className={structure1h.bias === 'BULLISH' ? 'greenText' : structure1h.bias === 'BEARISH' ? 'redText' : ''}>{structure1h.bias}</b><small>{structure1h.summary}</small></div>
+              <div className="structureCard"><span>15M Structure</span><b className={structure15.bias === 'BULLISH' ? 'greenText' : structure15.bias === 'BEARISH' ? 'redText' : ''}>{structure15.bias}</b><small>{structure15.summary}</small></div>
+            </div>
+            <div className="eventGrid">
+              <div className="eventCard"><span>Recent Structure Events</span><div className="eventList">{chartStructure.events.length === 0 ? <small>Tidak ada event structure terbaru.</small> : chartStructure.events.slice(-5).map((ev, idx) => <div key={`${ev.label}-${ev.time}-${idx}`} className={`eventRow ${ev.label.includes('UP') ? 'up' : 'down'}`}>{ev.label} • ${fmt(ev.price)}</div>)}</div></div>
+              <div className="eventCard"><span>Order Block Queue</span><div className="eventList">{[...orderBlocks.bullish.slice(0,2), ...orderBlocks.bearish.slice(0,2)].length === 0 ? <small>Belum ada OB prioritas.</small> : [...orderBlocks.bullish.slice(0,2), ...orderBlocks.bearish.slice(0,2)].map((ob, idx) => <div key={`${ob.type}-${ob.sourceTime}-${idx}`} className={`eventRow ${ob.type === 'BULLISH_OB' ? 'up' : 'down'}`}>{ob.type === 'BULLISH_OB' ? 'Bull OB' : 'Bear OB'} • ${fmt(ob.bottom)} - ${fmt(ob.top)} • {ob.quality} • {ob.mitigated ? 'Mitigated' : 'Fresh'}</div>)}</div></div>
+            </div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+
+          <section id="sniper" className={`panel sniperPanel ${statusTone}`}>
+            {!plan ? <div className="locked"><AlertTriangle /> LIVE API belum aktif / data belum cukup. Tidak ada demo data.</div> : <>
+              <div className="sniperHead"><div><span className="label">SNIPER STATUS ENGINE • {sniperMode}</span><h2>{plan.status}</h2></div><div className="sniperActions"><button className="copyBtn" onClick={copyPlan}><Clipboard size={15} /> Copy Plan</button><button className="copyBtn secondary" onClick={exportAnalysisText}>Export TXT</button></div></div>
+              <div className="planGrid">
+                <div className="planCard"><span>BIAS</span><b>{plan.bias}</b></div>
+                <div className="planCard"><span>CONFLUENCE</span><b>{plan.confluenceScore || plan.confidence}/100</b></div>
+                <div className="planCard"><span>ENTRY ZONE</span><b>{plan.entryZone ? `$${fmt(plan.entryZone[0])} - $${fmt(plan.entryZone[1])}` : '-'}</b></div>
+                <div className="planCard"><span>INVALIDASI</span><b>{plan.invalidation}</b></div>
+                <div className="planCard"><span>ENTRY AGGRESSIVE</span><b>{selectedExecution ? `$${fmt(selectedExecution.aggressive)}` : '-'}</b></div>
+                <div className="planCard"><span>ENTRY MAIN</span><b>{selectedExecution ? `$${fmt(selectedExecution.main)}` : '-'}</b></div>
+                <div className="planCard"><span>ENTRY CONSERVATIVE</span><b>{selectedExecution ? `$${fmt(selectedExecution.conservative)}` : '-'}</b></div>
+                <div className="planCard"><span>STOP LOSS</span><b>{selectedExecution ? `$${fmt(selectedExecution.stopLoss)}` : '-'}</b></div>
+              </div>
+              {selectedExecution && <div className="entryLadder">
+                <div className="entryLadderTitle">Exact Entry Ladder</div>
+                <div className="entryLadderGrid">
+                  <div><span>Aggressive</span><b>${fmt(selectedExecution.aggressive)}</b><small>touch refinement luar</small></div>
+                  <div><span>Main</span><b>${fmt(selectedExecution.main)}</b><small>mid-zone optimal</small></div>
+                  <div><span>Conservative</span><b>${fmt(selectedExecution.conservative)}</b><small>deep fill zone</small></div>
+                  <div><span>TP Ladder</span><b>${fmt(selectedExecution.tps[0])} / ${fmt(selectedExecution.tps[1])} / ${fmt(selectedExecution.tps[2])}</b><small>TP1 • TP2 • TP3</small></div>
+                </div>
+              </div>}
+              <div className="anchorNotice">
+                <b>Fixed Sniper Model:</b> Bias {SNIPER_BIAS_TFS} • Entry Zone {SNIPER_ENTRY_TF} • Trigger/Invalidasi {SNIPER_TRIGGER_TF}. Chart TF hanya untuk visual.
+              </div>
+              <div className="confluenceGrid">
+                <div><span>Structure</span><b>{plan.structureScore || 0}</b></div>
+                <div><span>OB</span><b>{plan.obScore || 0}</b></div>
+                <div><span>SNR</span><b>{plan.snrScore || 0}</b></div>
+                <div><span>Flow</span><b>{plan.flowScorePart || 0}</b></div>
+                <div><span>Liquidity</span><b>{plan.liquidityScore || 0}</b></div>
+              </div>
+              <div className="copyText"><pre>{copyText}</pre></div>
+            </>}
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+
+          <section id="history" className="panel historyPanel">
+            <div className="scannerHeader">
+              <div><div className="sectionTitle"><Clipboard size={15} /> Last 5 Sniper Plan</div><p className="muted small">Riwayat status terbaru tersimpan lokal di browser.</p></div>
+              <button className="miniBtn" onClick={clearPlanHistory}>Clear</button>
+            </div>
+            <div className="historyList">
+              {planHistory.length === 0 ? <div className="emptyState">Belum ada history plan.</div> : planHistory.map((h, idx) => (
+                <div key={`${h.ts}-${idx}`} className={`historyItem ${h.status.includes('LONG') ? 'long' : h.status.includes('SHORT') ? 'short' : 'wait'}`}>
+                  <div className="historyTop"><b>{h.symbol} • {h.status}</b><span>{new Date(h.ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span></div>
+                  <small>{h.mode} • Score {h.score}/100 • Entry {h.entry}</small>
+                  <p>{h.bias}</p>
+                  <button className="historyCopy" onClick={() => navigator.clipboard.writeText(h.text)}>Copy</button>
+                </div>
+              ))}
+            </div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+
+          <section id="flow" className="panel flowPanel">
+            <div className="sectionTitle"><Gauge size={15} /> Flow Scoring Engine</div>
+            <div className="scoreBoard">
+              <div className="scoreCard bull"><span>Bullish Score</span><b>{flow.bullishScore}</b><small>{flow.bias === 'BULLISH' ? 'Dominant' : 'Pressure'}</small></div>
+              <div className="scoreCard bear"><span>Bearish Score</span><b>{flow.bearishScore}</b><small>{flow.bias === 'BEARISH' ? 'Dominant' : 'Pressure'}</small></div>
+              <div className="scoreCard main"><span>Flow Bias</span><b>{flow.bias}</b><small>{flow.state}</small></div>
+            </div>
+            <div className="flowGrid proFlow">
+              <Metric name="Funding Now" value={`${(fundingRate * 100).toFixed(4)}%`} tone={fundingRate >= 0 ? 'green' : 'red'} note="Crowded jika ekstrem" />
+              <Metric name="Latest Funding Hist" value={`${(topFunding * 100).toFixed(4)}%`} tone={topFunding >= 0 ? 'green' : 'red'} note="History endpoint" />
+              <Metric name="OI Change" value={fmtPct(oiChangePct)} tone={oiChangePct >= 0 ? 'green' : 'red'} note="Open interest 5m x30" />
+              <Metric name="Global L/S" value={longShortRatio ? longShortRatio.toFixed(2) : '-'} tone={longShortRatio > 1.2 ? 'green' : longShortRatio < .85 ? 'red' : 'neutral'} note={`Long ${fmtPct(safeNumber(latestLs?.longAccount) * 100, 1)} / Short ${fmtPct(safeNumber(latestLs?.shortAccount) * 100, 1)}`} />
+              <Metric name="Top Account L/S" value={topLongShortRatio ? topLongShortRatio.toFixed(2) : '-'} tone={topLongShortRatio > 1.2 ? 'green' : topLongShortRatio < .85 ? 'red' : 'neutral'} note="Top trader account ratio" />
+              <Metric name="Taker Buy/Sell" value={takerRatio ? takerRatio.toFixed(2) : '-'} tone={takerRatio > 1.08 ? 'green' : takerRatio < .92 ? 'red' : 'neutral'} note={`Buy ${fmtShort(safeNumber(latestTaker?.buyVol))} / Sell ${fmtShort(safeNumber(latestTaker?.sellVol))}`} />
+            </div>
+            <div className="flowNote"><b>Kesimpulan Flow:</b> {flow.state} — {flow.reasons.join(' | ')}</div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+
+          <section id="minimap" className="panel miniMapPanel">
+            <div className="sectionTitle"><BarChart3 size={15} /> Mini Liquidity Map v2</div>
+            <p className="muted small">Proxy ringan dari order book Binance + account L/S ratio. Bid = limit buy wall, Ask = limit sell wall. Ini bukan Coinglass liquidation heatmap dan tidak bisa memastikan order itu open long/short atau close posisi.</p>
+            <div className="mapSummaryGrid">
+              <Metric name="Buy Limit Wall" value={`$${fmtShort(miniMap.bidTotal)}`} tone="green" note={`${miniMap.bidWalls.length} level bid terbesar`} />
+              <Metric name="Sell Limit Wall" value={`$${fmtShort(miniMap.askTotal)}`} tone="red" note={`${miniMap.askWalls.length} level ask terbesar`} />
+              <Metric name="Wall Pressure" value={miniMap.pressure} tone={miniMap.askTotal > miniMap.bidTotal ? 'red' : miniMap.bidTotal > miniMap.askTotal ? 'green' : 'neutral'} note={miniMap.magnet} />
+              <Metric name="Account Long/Short" value={`${miniMap.longPct ? miniMap.longPct.toFixed(1) : '-'}% / ${miniMap.shortPct ? miniMap.shortPct.toFixed(1) : '-'}%`} tone="neutral" note="Global L/S account ratio" />
+            </div>
+            <div className="wallGrid">
+              <WallColumn title="Support-side limit buy walls" items={miniMap.bidWalls} side="buy" />
+              <WallColumn title="Resistance-side limit sell walls" items={miniMap.askWalls} side="sell" />
+            </div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+
+          <section id="scanner" className="panel scannerPanel proScanner">
+            <div className="scannerHeader"><div><div className="sectionTitle"><Flame size={15} /> Entry Scanner Pro</div><p className="muted small">Ranking compact dari volume, volatilitas, dan heat score. List scroll supaya dashboard tetap ringan di HP.</p></div><span className="pill">Top {scannerRows.length}</span></div>
+            <div className="scannerTableHead"><span>Coin</span><span>Setup</span><span>24H</span><span>Heat</span><span>Volume</span></div>
+            <div className="scannerList scrollBox">
+              {scannerRows.map((r, idx) => (
+                <button key={r.symbol} className="scanRow proScanRow" onClick={() => setSelectedSymbol(r.symbol)}>
+                  <span className="rank">#{idx + 1}</span>
+                  <b>{r.symbol}</b>
+                  <span className={r.setup.includes('LONG') ? 'green' : r.setup.includes('SHORT') ? 'red' : ''}>{r.setup}</span>
+                  <span className={r.change >= 0 ? 'green' : 'red'}>{fmtPct(r.change)}</span>
+                  <span className="heat">{r.heatScore}</span>
+                  <small>${fmtShort(r.qv)} • {r.reason}</small>
+                </button>
+              ))}
+            </div>
+          </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+        </section>
+
+       <section id="backtest" className="panel backtestPanel">
+         <BacktestPanel />
+       </section>
+      </main>
+    </div>
+  );
+}
+
+function Metric({ name, value, note, tone }: { name: string; value: string; note?: string; tone?: 'green' | 'red' | 'neutral' }) {
+  return <div className="metric"><span>{name}</span><b className={tone === 'green' ? 'greenText' : tone === 'red' ? 'redText' : ''}>{value}</b>{note && <small>{note}</small>}</div>;
+}
+
+function WallColumn({ title, items, side }: { title: string; items: MiniWall[]; side: 'buy' | 'sell' }) {
+  return <div className={`wallColumn ${side === 'buy' ? 'buyWall' : 'sellWall'}`}>
+    <div className="wallTitle">{title}</div>
+    <div className="wallList">
+      {items.length === 0 ? <div className="emptyState">Belum ada wall kuat.</div> : items.map((x, idx) => (
+        <div className="wallRow" key={`${side}-${x.price}-${idx}`}>
+          <div className="wallMeta"><b>${fmt(x.price)}</b><span>{x.distance.toFixed(2)}% dari harga</span></div>
+          <div className="wallValue">${fmtShort(x.notional)}</div>
+          <div className="wallBar"><i style={{ width: `${Math.max(8, Math.min(100, x.strength))}%` }} /></div>
+        </div>
+      ))}
+    </div>
+  </div>;
+}

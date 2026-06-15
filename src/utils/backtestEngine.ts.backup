@@ -1,0 +1,498 @@
+import { Candle, OrderBlock, Zone, StructureSummary, FlowEngine } from '../types';
+import { detectOrderBlocks, analyzeStructure, detectSrnZones, detect5mCandlestickTrigger, analyzeTimeframe } from './smcEngine';
+import { calcConfluence, buildFlowEngine } from './flowEngine';
+import { buildExecutionLevels, fmt, pctDistance, clamp } from './helpers';
+
+export type BacktestTrade = {
+  index: number;
+  timestamp: number;
+  side: 'LONG' | 'SHORT';
+  entryPrice: number;
+  stopLoss: number;
+  tp1: number;
+  tp2: number;
+  tp3: number;
+  exitPrice: number;
+  result: 'WIN' | 'LOSS' | 'BREAKEVEN' | 'OPEN';
+  pnl: number;
+  pnlPct: number;
+  rrr: number;
+  holdCandles: number;
+  score: number;
+  pattern: string;
+};
+
+export type BacktestMetrics = {
+  totalTrades: number;
+  wins: number;
+  losses: number;
+  breakeven: number;
+  winRate: number;
+  profitFactor: number;
+  avgWin: number;
+  avgLoss: number;
+  avgRRR: number;
+  totalPnl: number;
+  totalPnlPct: number;
+  maxDrawdown: number;
+  sharpeRatio: number;
+  expectancy: number;
+  avgHoldCandles: number;
+  minSampleWarning: boolean;
+};
+
+export type BacktestConfig = {
+  symbol: string;
+  timeframe: '5m' | '15m' | '1h' | '4h';
+  candleLimit: number;
+  sniperMode: 'AGGRESSIVE' | 'NORMAL' | 'CONSERVATIVE';
+  minConfluence: number;
+  requireOB: boolean;
+  requireTrigger: boolean;
+  slippage: number;
+  fee: number;
+};
+
+export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
+  symbol: 'BTCUSDT',
+  timeframe: '15m',
+  candleLimit: 1000,
+  sniperMode: 'NORMAL',
+  minConfluence: 65,
+  requireOB: true,
+  requireTrigger: true,
+  slippage: 0.1,
+  fee: 0.075
+};
+
+const API = 'https://fapi.binance.com';
+
+async function fetchHistoricalData(symbol: string, timeframe: string, limit: number): Promise<Candle[]> {
+  const allCandles: Candle[] = [];
+  let startTime = Date.now() - (limit * 60 * 1000 * getTimeframeMinutes(timeframe));
+  
+  while (allCandles.length < limit) {
+    const batchSize = Math.min(1500, limit - allCandles.length);
+    const url = `${API}/fapi/v1/klines?symbol=${symbol}&interval=${timeframe}&limit=${batchSize}&startTime=${startTime}`;
+    
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      
+      if (!Array.isArray(data) || data.length === 0) break;
+      
+      const candles = data.map((k: any[]) => ({
+        t: Number(k[0]),
+        o: Number(k[1]),
+        h: Number(k[2]),
+        l: Number(k[3]),
+        c: Number(k[4]),
+        v: Number(k[5]),
+        qv: Number(k[7]),
+        trades: Number(k[8]),
+        takerBuyBase: Number(k[9]),
+        takerBuyQuote: Number(k[10])
+      })).filter((c: Candle) => Number.isFinite(c.c));
+      
+      allCandles.push(...candles);
+      startTime = candles[candles.length - 1].t + 1;
+      
+      if (candles.length < batchSize) break;
+    } catch (err) {
+      console.error('Fetch error:', err);
+      break;
+    }
+  }
+  
+  return allCandles.slice(0, limit);
+}
+
+function getTimeframeMinutes(tf: string): number {
+  const map: Record<string, number> = { '1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440 };
+  return map[tf] || 15;
+}
+
+function simulateTrade(
+  candles: Candle[],
+  entryIndex: number,
+  side: 'LONG' | 'SHORT',
+  entryPrice: number,
+  stopLoss: number,
+  tp1: number,
+  tp2: number,
+  tp3: number,
+  slippage: number,
+  fee: number
+): BacktestTrade {
+  const future = candles.slice(entryIndex + 1, entryIndex + 200);
+  let exitPrice = entryPrice;
+  let result: BacktestTrade['result'] = 'OPEN';
+  let holdCandles = 0;
+  
+  for (let i = 0; i < future.length; i++) {
+    const c = future[i];
+    holdCandles++;
+    
+    if (side === 'LONG') {
+      // Cek SL dulu (prioritas)
+      if (c.l <= stopLoss) {
+        exitPrice = stopLoss * (1 - slippage / 100);
+        result = 'LOSS';
+        break;
+      }
+      // Cek TP3 (terjauh)
+      if (c.h >= tp3) {
+        exitPrice = tp3;
+        result = 'WIN';
+        break;
+      }
+      // Cek TP2
+      if (c.h >= tp2) {
+        exitPrice = tp2;
+        result = 'WIN';
+        break;
+      }
+      // Cek TP1 (terdekat)
+      if (c.h >= tp1) {
+        exitPrice = tp1;
+        result = 'WIN';
+        break;
+      }
+    } else {
+      // SHORT
+      if (c.h >= stopLoss) {
+        exitPrice = stopLoss * (1 + slippage / 100);
+        result = 'LOSS';
+        break;
+      }
+      if (c.l <= tp3) {
+        exitPrice = tp3;
+        result = 'WIN';
+        break;
+      }
+      if (c.l <= tp2) {
+        exitPrice = tp2;
+        result = 'WIN';
+        break;
+      }
+      if (c.l <= tp1) {
+        exitPrice = tp1;
+        result = 'WIN';
+        break;
+      }
+    }
+  }
+  
+  // Jika tidak hit TP/SL dalam 200 candle
+  if (result === 'OPEN') {
+    const lastCandle = future[future.length - 1];
+    exitPrice = lastCandle ? lastCandle.c : entryPrice;
+    result = 'BREAKEVEN';
+  }
+  
+  // Kalkulasi PnL (FIX: loss harus negatif)
+  const pnlRaw = side === 'LONG' 
+    ? ((exitPrice - entryPrice) / entryPrice) * 100
+    : ((entryPrice - exitPrice) / entryPrice) * 100;
+  
+  // Risk & Reward
+  const risk = Math.abs(entryPrice - stopLoss) / entryPrice;
+  const reward = Math.abs(exitPrice - entryPrice) / entryPrice;
+  const rrr = risk > 0 ? reward / risk : 0;
+  
+  // Fee (masuk + keluar)
+  const feeCost = fee * 2;
+  const pnlAfterFee = pnlRaw - feeCost;
+  
+  return {
+    index: entryIndex,
+    timestamp: candles[entryIndex].t,
+    side,
+    entryPrice,
+    stopLoss,
+    tp1,
+    tp2,
+    tp3,
+    exitPrice,
+    result,
+    pnl: pnlAfterFee,
+    pnlPct: pnlAfterFee,
+    rrr,
+    holdCandles,
+    score: 0,
+    pattern: ''
+  };
+}
+
+function calculateMetrics(trades: BacktestTrade[]): BacktestMetrics {
+  const minSampleWarning = trades.length < 30;
+  
+  if (trades.length === 0) {
+    return {
+      totalTrades: 0,
+      wins: 0,
+      losses: 0,
+      breakeven: 0,
+      winRate: 0,
+      profitFactor: 0,
+      avgWin: 0,
+      avgLoss: 0,
+      avgRRR: 0,
+      totalPnl: 0,
+      totalPnlPct: 0,
+      maxDrawdown: 0,
+      sharpeRatio: 0,
+      expectancy: 0,
+      avgHoldCandles: 0,
+      minSampleWarning
+    };
+  }
+  
+  const wins = trades.filter(t => t.result === 'WIN');
+  const losses = trades.filter(t => t.result === 'LOSS');
+  const breakeven = trades.filter(t => t.result === 'BREAKEVEN');
+  
+  const winRate = (wins.length / trades.length) * 100;
+  
+  // Gross Profit (hanya dari winning trades)
+  const grossProfit = wins.reduce((sum, t) => sum + t.pnl, 0);
+  
+  // Gross Loss (harus POSITIF untuk kalkulasi, tapi avgLoss akan negatif)
+  const grossLossAbs = Math.abs(losses.reduce((sum, t) => sum + t.pnl, 0));
+  const profitFactor = grossLossAbs > 0 ? grossProfit / grossLossAbs : grossProfit > 0 ? 999 : 0;
+  
+  // Average Win (positif)
+  const avgWin = wins.length > 0 ? grossProfit / wins.length : 0;
+  
+  // Average Loss (NEGATIF - ini yang benar)
+  const avgLoss = losses.length > 0 
+    ? losses.reduce((sum, t) => sum + t.pnl, 0) / losses.length 
+    : 0;
+  
+  const avgRRR = trades.reduce((sum, t) => sum + t.rrr, 0) / trades.length;
+  
+  const totalPnl = trades.reduce((sum, t) => sum + t.pnl, 0);
+  const totalPnlPct = totalPnl;
+  
+  // Max Drawdown (FIX: harus positif, menunjukkan penurunan dari peak)
+  let maxDrawdown = 0;
+  let peak = 0;
+  let equity = 0;
+  for (const trade of trades) {
+    equity += trade.pnl;
+    if (equity > peak) peak = equity;
+    const drawdown = peak - equity;
+    if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+  }
+  
+  // Sharpe Ratio
+  const returns = trades.map(t => t.pnl);
+  const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+  const variance = returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length;
+  const stdDev = Math.sqrt(variance);
+  const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252) : 0;
+  
+  // Expectancy
+  const expectancy = (winRate / 100) * avgWin + ((100 - winRate) / 100) * avgLoss;
+  
+  const avgHoldCandles = trades.reduce((sum, t) => sum + t.holdCandles, 0) / trades.length;
+  
+  return {
+    totalTrades: trades.length,
+    wins: wins.length,
+    losses: losses.length,
+    breakeven: breakeven.length,
+    winRate,
+    profitFactor,
+    avgWin,
+    avgLoss,
+    avgRRR,
+    totalPnl,
+    totalPnlPct,
+    maxDrawdown,
+    sharpeRatio,
+    expectancy,
+    avgHoldCandles,
+    minSampleWarning
+  };
+}
+
+export async function runBacktest(config: BacktestConfig): Promise<{
+  trades: BacktestTrade[];
+  metrics: BacktestMetrics;
+  candles: Candle[];
+}> {
+  console.log(`Starting backtest: ${config.symbol} ${config.timeframe} x${config.candleLimit}`);
+  
+  const candles = await fetchHistoricalData(config.symbol, config.timeframe, config.candleLimit);
+  
+  if (candles.length < 100) {
+    throw new Error(`Insufficient data: only ${candles.length} candles fetched`);
+  }
+  
+  const trades: BacktestTrade[] = [];
+  const minLookback = 50;
+  
+  // ANTI-LOOKAHEAD: Loop dari index 50 sampai candles.length - 20
+  // Hanya pakai data sampai index i-1 untuk deteksi setup
+  for (let i = minLookback; i < candles.length - 20; i++) {
+    // FIX: Hanya pakai historical data sampai candle i-1 (ANTI-LOOKAHEAD)
+    const historicalCandles = candles.slice(0, i);
+    const currentPrice = candles[i].c;
+    
+    // Deteksi setup dari historical data
+    const ob = detectOrderBlocks(historicalCandles, currentPrice);
+    const structure = analyzeStructure(historicalCandles);
+    const zones = detectSrnZones(historicalCandles, currentPrice, 0.14, config.timeframe);
+    
+    const bullOb = ob.bullish[0];
+    const bearOb = ob.bearish[0];
+    const support = zones.support[0];
+    const resistance = zones.resistance[0];
+    
+    const thresholds = config.sniperMode === 'AGGRESSIVE' 
+      ? { valid: 60, ready: 50 }
+      : config.sniperMode === 'CONSERVATIVE'
+      ? { valid: 80, ready: 70 }
+      : { valid: 70, ready: 60 };
+    
+    // LONG Setup
+    if (bullOb && !bullOb.invalidated && bullOb.quality !== 'WEAK') {
+      const distToOB = Math.abs(pctDistance(currentPrice, (bullOb.top + bullOb.bottom) / 2));
+      
+      if (distToOB < 1.5) {
+        // FIX: Pakai 28 candle sebelum entry (bukan termasuk candle entry)
+        const k5 = candles.slice(Math.max(0, i - 28), i);
+        const zone = { low: bullOb.bottom, high: bullOb.top };
+        const trigger = detect5mCandlestickTrigger(k5, zone, 'LONG');
+        
+        const mtfScore = structure.bias === 'BULLISH' ? 2 : 0;
+        const flow: FlowEngine = {
+          bias: structure.bias === 'BULLISH' ? 'BULLISH' : 'NEUTRAL',
+          state: 'Backtest',
+          bullishScore: structure.bias === 'BULLISH' ? 60 : 30,
+          bearishScore: structure.bias === 'BEARISH' ? 60 : 30,
+          flowScore: 50,
+          netScore: 0,
+          reasons: []
+        };
+        
+        const confluence = calcConfluence({
+          side: 'LONG',
+          structure4h: structure,
+          structure1h: structure,
+          structure15: structure,
+          ob: bullOb,
+          support,
+          resistance,
+          flow,
+          miniPressure: 'BALANCED'
+        });
+        
+        const shouldEnter = config.requireTrigger 
+          ? trigger.valid && confluence.total >= thresholds.valid
+          : confluence.total >= thresholds.ready;
+        
+        if (shouldEnter && (!config.requireOB || bullOb)) {
+          const entryPrice = currentPrice * (1 + config.slippage / 100);
+          const exec = buildExecutionLevels('LONG', zone, bullOb.bottom);
+          
+          const trade = simulateTrade(
+            candles,
+            i,
+            'LONG',
+            entryPrice,
+            exec.stopLoss,
+            exec.tps[0],
+            exec.tps[1],
+            exec.tps[2],
+            config.slippage,
+            config.fee
+          );
+          
+          trade.score = confluence.total;
+          trade.pattern = trigger.pattern;
+          trades.push(trade);
+        }
+      }
+    }
+    
+    // SHORT Setup
+    if (bearOb && !bearOb.invalidated && bearOb.quality !== 'WEAK') {
+      const distToOB = Math.abs(pctDistance(currentPrice, (bearOb.top + bearOb.bottom) / 2));
+      
+      if (distToOB < 1.5) {
+        const k5 = candles.slice(Math.max(0, i - 28), i);
+        const zone = { low: bearOb.bottom, high: bearOb.top };
+        const trigger = detect5mCandlestickTrigger(k5, zone, 'SHORT');
+        
+        const mtfScore = structure.bias === 'BEARISH' ? 2 : 0;
+        const flow: FlowEngine = {
+          bias: structure.bias === 'BEARISH' ? 'BEARISH' : 'NEUTRAL',
+          state: 'Backtest',
+          bullishScore: structure.bias === 'BULLISH' ? 60 : 30,
+          bearishScore: structure.bias === 'BEARISH' ? 60 : 30,
+          flowScore: 50,
+          netScore: 0,
+          reasons: []
+        };
+        
+        const confluence = calcConfluence({
+          side: 'SHORT',
+          structure4h: structure,
+          structure1h: structure,
+          structure15: structure,
+          ob: bearOb,
+          support,
+          resistance,
+          flow,
+          miniPressure: 'BALANCED'
+        });
+        
+        const shouldEnter = config.requireTrigger
+          ? trigger.valid && confluence.total >= thresholds.valid
+          : confluence.total >= thresholds.ready;
+        
+        if (shouldEnter && (!config.requireOB || bearOb)) {
+          const entryPrice = currentPrice * (1 - config.slippage / 100);
+          const exec = buildExecutionLevels('SHORT', zone, bearOb.top);
+          
+          const trade = simulateTrade(
+            candles,
+            i,
+            'SHORT',
+            entryPrice,
+            exec.stopLoss,
+            exec.tps[0],
+            exec.tps[1],
+            exec.tps[2],
+            config.slippage,
+            config.fee
+          );
+          
+          trade.score = confluence.total;
+          trade.pattern = trigger.pattern;
+          trades.push(trade);
+        }
+      }
+    }
+  }
+  
+  const metrics = calculateMetrics(trades);
+  
+  console.log(`Backtest complete: ${trades.length} trades, ${metrics.winRate.toFixed(1)}% win rate`);
+  
+  return { trades, metrics, candles };
+}
+
+export function exportBacktestToCSV(trades: BacktestTrade[], metrics: BacktestMetrics): string {
+  const header = 'Index,Timestamp,Side,Entry,SL,TP1,TP2,TP3,Exit,Result,PnL%,RRR,Hold,Score,Pattern\n';
+  const rows = trades.map(t => 
+    `${t.index},${t.timestamp},${t.side},${t.entryPrice.toFixed(4)},${t.stopLoss.toFixed(4)},${t.tp1.toFixed(4)},${t.tp2.toFixed(4)},${t.tp3.toFixed(4)},${t.exitPrice.toFixed(4)},${t.result},${t.pnl.toFixed(2)},${t.rrr.toFixed(2)},${t.holdCandles},${t.score},${t.pattern}`
+  ).join('\n');
+  
+  const summary = `\n\nSUMMARY\nTotal Trades,${metrics.totalTrades}\nWins,${metrics.wins}\nLosses,${metrics.losses}\nWin Rate,${metrics.winRate.toFixed(2)}%\nProfit Factor,${metrics.profitFactor.toFixed(2)}\nAvg Win,${metrics.avgWin.toFixed(2)}%\nAvg Loss,${metrics.avgLoss.toFixed(2)}%\nTotal PnL,${metrics.totalPnl.toFixed(2)}%\nMax Drawdown,${metrics.maxDrawdown.toFixed(2)}%\nSharpe Ratio,${metrics.sharpeRatio.toFixed(2)}\nExpectancy,${metrics.expectancy.toFixed(2)}%\nMin Sample Warning,${metrics.minSampleWarning}\n`;
+  
+  return header + rows + summary;
+}
