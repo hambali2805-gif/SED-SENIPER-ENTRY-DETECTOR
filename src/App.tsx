@@ -1,5 +1,6 @@
 import React,
-import { SMCChart } from './components/SMCChart'; { useEffect, useMemo, useRef, useState } from 'react';
+import { SMCChart } from './components/SMCChart';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import brandLogoFull from './assets/sniper-entry-detector-full.jpg';
 import brandLogoIcon from './assets/sniper-entry-detector-icon.png';
 import {
