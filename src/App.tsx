@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React,
+import { SMCChart } from './components/SMCChart'; { useEffect, useMemo, useRef, useState } from 'react';
 import brandLogoFull from './assets/sniper-entry-detector-full.jpg';
 import brandLogoIcon from './assets/sniper-entry-detector-icon.png';
 import {
@@ -2436,17 +2437,8 @@ export default function App() {
             </div>
             <div className="canvasWrap proChart">
               {loading && <div className="loading"><RefreshCw className="spin" /> Mengambil Binance Live API...</div>}
-              <canvas
-                ref={canvasRef}
-                onMouseDown={onCanvasMouseDown}
-                onMouseMove={onCanvasMove}
-                onMouseUp={stopCanvasMouseDrag}
-                onMouseLeave={() => { setHover(null); stopCanvasMouseDrag(); }}
-                onTouchStart={onCanvasTouchStart}
-                onTouchMove={onCanvasTouchMove}
-                onTouchEnd={onCanvasTouchEnd}
-              />
-              {hover && <div className="hoverBox">O {fmt(hover.o)} • H {fmt(hover.h)} • L {fmt(hover.l)} • C {fmt(hover.c)} • V {fmt(hover.v,0)}</div>}
+              <SMCChart data={candles} />
+              
             </div>
             <div className="mtfGrid compactCards">
               {mtfAnalysis.map(t => <div key={t.tf} className="tfCard"><span>{t.tf}</span><b className={t.trend === 'BULLISH' ? 'greenText' : t.trend === 'BEARISH' ? 'redText' : ''}>{t.trend}</b><small>{t.momentum.toFixed(2)}% • {t.volumeState}</small></div>)}
